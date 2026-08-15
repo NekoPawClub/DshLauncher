@@ -28,10 +28,12 @@ DeepSeek Harness（dsh）的 Windows 系统托盘守护启动器，Rust 编写�
 - 启动器启动时 dsh 已在运行（端口连通）→ 直接复用，不杀不重启
 
 ### 启动流程（spawn_startup_flow）
-- restart=true：`stop_harness_async()`（异步发起，不阻塞）→ 主循环 `try_wait` 检测清理完成
-- 清理完成后 `start_harness()`（仅尝试一次）→ 轮询端口就绪（500ms 间隔，最长 120s）
+- **Job Object + KILL_ON_JOB_CLOSE（核心设计）**：start_harness 把 dsh 进程树（powershell→cmd→npx→node）挂入全局 Job；DshLauncher 退出/崩溃/被强杀时 Job 句柄随进程关闭，Windows 自动终止 dsh —— 从设计上保证无孤儿残留，常态启动/退出**不需要清理流程**
+- 启动前仅当 `port_occupied()`（bind 探测失败 = 端口被外部进程占，毫秒级）才 `stop_harness()`（TerminateJobObject 秒杀 + 兜底脚本）
+- `start_harness()`（仅一次）→ 轮询端口就绪（500ms 间隔，最长 120s）
 - 动画由独立动画线程驱动（见"动画策略"），flow 不负责换帧
 - 结束：`starting=false` → 就绪时停动画 → 发 `AnimationDone` 事件 → 主线程按 `open_when_ready || pending_open` 打开页面
+- 停止 dsh = `TerminateJobObject`（毫秒级，替代原 PowerShell stop 的 1~3 秒）；stop_script 仅作外部残留兜底
 
 ### 事件流
 - 菜单/托盘事件：`MenuEvent::set_event_handler` / `TrayIconEvent::set_event_handler` → `EventLoopProxy::send_event` → `ApplicationHandler::user_event`
@@ -40,8 +42,9 @@ DeepSeek Harness（dsh）的 Windows 系统托盘守护启动器，Rust 编写�
 ### 菜单行为
 - 打开：端口通 → `open_page()`；不通 → `pending_open=true` + 立即 `set_anim(true)`，watchdog 拉起后就绪自动打开
 - 配置：`open_config_dir()`（见下）
-- 重启：点击瞬间 `set_anim(true)`（扫描灯立即流动）+ `pending_open=true` + 异步 `stop_harness()`，watchdog 拉起，flow 就绪后停动画并打开页面
-- 退出：`quitting=true` → 多轮（最多 3 轮）`stop_harness` + 端口检查 → `event_loop.exit()`
+- 重启：点击瞬间 `set_anim(true)`（扫描灯立即流动）+ `pending_open=true` + `thread::spawn(|| stop_harness())`（**必须异步**：动画换帧依赖主线程事件循环，同步执行带 sleep 的 stop 会阻塞主线程导致动画延迟出现），watchdog 拉起，flow 就绪后停动画并打开页面
+- 退出：`quitting=true` → 隐藏托盘图标（即时反馈）→ 停止动画 → **提前 `CloseHandle` 释放单例互斥体**（新实例可立即启动）→ `stop_harness()`（Job 秒杀，单次即可；KILL_ON_JOB_CLOSE 兜底崩溃场景）→ `event_loop.exit()`
+  - 背景：若不提前释放，图标隐藏到进程退出的窗口期内新实例会被单例拒绝启动（用户会以为程序没响应）
 - 左键单击无功能（`with_menu_on_left_click(false)`）；左键双击等同"打开"
 
 ### 托盘动画（16 帧，150ms/帧，扫描仪灯管定稿）
@@ -137,6 +140,7 @@ DeepSeek Harness（dsh）的 Windows 系统托盘守护启动器，Rust 编写�
 - **工具调用被中断后**：先确认外部状态（文件/进程/端口）再决定重试——中断的调用结果未知，幂等操作可重试，有副作用的先验证
 - **用户机器与沙箱网络差异**：沙箱 schannel 被网关阻断（需临时镜像），用户机器直连正常。构建前先判断在哪构建：沙箱内先查 8081 代理是否还在跑（在跑直接复用，不用重建镜像）
 - **动画需求迭代要点**（用户偏好）：不要减淡只高亮；滚动条要"滚动游走"不要"进度填充"；程序启动即流动、就绪才停；重启点击瞬间起动画
+- **主线程事件循环禁止耗时操作**（用户发现的实际问题）：winit 事件循环（user_event 处理）里同步执行任何含 sleep/网络/进程管理的操作，都会阻塞动画换帧与所有事件处理。真实案例：重启菜单把 `stop_harness()` 从 `thread::spawn` 改为同步调用后，扫描灯延迟出现（Job 秒杀虽快但 stop 内含 300ms sleep + 端口检查）。规则：**凡是可能耗时（>10ms）的操作一律放后台线程，事件循环只做状态切换与 UI 更新**
 
 ## 工具调用经验（避免反复出错）
 
@@ -154,4 +158,8 @@ DeepSeek Harness（dsh）的 Windows 系统托盘守护启动器，Rust 编写�
 - **PowerShell 5.1 编码**：无 BOM 的 UTF-8 脚本中文字符串会按 GBK 乱码导致解析错误——脚本输出用英文，或保存为 UTF-8 BOM
 - **沙箱查询限制**：`Get-NetTCPConnection` 常返回空（用 `netstat -ano`）；WMI `CommandLine` 可能为空；`Get-CimInstance` 可能被拒（用 netstat 代替）
 - **后台任务**：长命令用 `run_in_background: true`，用 `job_output({wait: true})` 阻塞等待
+- **超时按任务实际需要设置，不要一律 600s**（用户明确批评过）：增量编译 60s、首次编译 180s、运行测试 100~200s、一般命令 30s；时间到了还 running 就再等一轮，而不是给超长超时
+- **Start-Process 长生命周期进程必须重定向输出**（用户发现的关键坑）：在后台 job 内 `Start-Process node ...` 启动代理等常驻进程时，子进程会继承 job 管道的 stdout/stderr 句柄——cargo 编译完成、pwsh 脚本结束后 job 仍显示 running（管道不 EOF），直到超时。修复：`-RedirectStandardOutput $logOut -RedirectStandardError $logErr` 重定向到日志文件。任何 Start-Process 常驻进程（代理、假 dsh 等）都要加
+- **构建命令禁用 `Select-Object -Last N`**（用户发现的关键坑）：它必须等命令完全结束才输出，导致编译失败信息"到超时才出现"。正确写法：`cargo build 2>&1` 流式输出 + 末尾 `Write-Host ("[exit-code: " + $LASTEXITCODE + "]")`。另注意：build.rs 失败后 cargo 会打印 "build failed, waiting for other jobs" 并继续等并行 crate 编译完成（可能 10~30s）才退出——这是 cargo 行为，流式输出后失败信息立即可见，不必等 job 结束
+- **代理等常驻进程用独立后台 job 启动**（脚本立即结束、代理常驻），构建用另一个 job，两者生命周期解耦；job_kill 构建 job 会连带杀掉其启动的代理（进程树）
 - **git 状态**：`.cargo/`、根目录 exe 副本、test-bin 均不应入库；改动后检查 `git status` 是否干净

@@ -15,7 +15,6 @@
 mod dsh;
 
 use std::error::Error;
-use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -25,6 +24,7 @@ use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use windows_sys::Win32::Foundation::HANDLE;
 
 /// 事件循环的自定义用户事件
 enum UserEvent {
@@ -54,15 +54,14 @@ struct TrayIcons {
     frames: Vec<Icon>,
 }
 
-/// 启动流程线程：清理（异步并行）→ 启动 → 等待就绪 → 发送完成事件。
+/// 启动流程线程：端口被占才清理（Job 设计保证常态无残留）→ 启动 → 等待就绪。
 /// 动画由独立动画线程驱动（探测到未运行即已流动），本线程只负责流程；
-/// 各阶段都会检查退出请求（quitting），退出时立即放弃，避免残留启动进程。
+/// 各阶段都会检查退出请求（quitting），退出时立即放弃。
 fn spawn_startup_flow(
     proxy: EventLoopProxy<UserEvent>,
     starting: Arc<AtomicBool>,
     quitting: Arc<AtomicBool>,
     anim_running: Arc<AtomicBool>,
-    restart: bool,
     open_when_ready: bool,
 ) {
     thread::spawn(move || {
@@ -71,35 +70,34 @@ fn spawn_startup_flow(
             return;
         }
 
-        // restart 时异步发起清理：不阻塞，动画照常流动
-        let mut stop_child: Option<Child> = if restart && !dsh::port_ready() {
-            dsh::stop_harness_async().ok()
-        } else {
-            None
-        };
+        // 仅当端口被残留进程占用时清理（罕见：非 Job 管理的外部进程；
+        // Job + KILL_ON_JOB_CLOSE 保证我们启动的 dsh 崩溃即释放端口，常态零清理）
+        if dsh::port_occupied() {
+            dsh::stop_harness();
+            // 等待端口释放（最多 5 秒）
+            let wf_deadline = Instant::now() + Duration::from_secs(5);
+            while dsh::port_occupied() && Instant::now() < wf_deadline {
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+        if quitting.load(Ordering::SeqCst) {
+            starting.store(false, Ordering::SeqCst);
+            return;
+        }
 
         let mut ready = dsh::port_ready();
-        let mut started = false;
-        let deadline = Instant::now() + Duration::from_secs(120);
-
-        // 主循环：轮询端口就绪，期间完成清理与启动（仅启动一次）
-        while !ready && Instant::now() < deadline && !quitting.load(Ordering::SeqCst) {
-            if !started {
-                let stop_done = match &mut stop_child {
-                    Some(child) => child.try_wait().ok().flatten().is_some(),
-                    None => true, // 无需清理，立即启动
-                };
-                if stop_done {
-                    started = true;
-                    let _ = dsh::start_harness();
-                    stop_child = None;
+        if !ready {
+            if dsh::start_harness().is_ok() {
+                // 轮询端口就绪（500ms 间隔，最长 120 秒）
+                let deadline = Instant::now() + Duration::from_secs(120);
+                while !ready && Instant::now() < deadline && !quitting.load(Ordering::SeqCst) {
+                    ready = dsh::port_ready();
+                    if ready {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(500));
                 }
             }
-            ready = dsh::port_ready();
-            if ready {
-                break;
-            }
-            thread::sleep(Duration::from_millis(500));
         }
 
         starting.store(false, Ordering::SeqCst);
@@ -125,6 +123,8 @@ struct App {
     pending_open: Arc<AtomicBool>,
     /// 退出请求标志：守护线程与启动流程据此停止
     quitting: Arc<AtomicBool>,
+    /// 单实例互斥体句柄（退出时提前释放，避免新实例被单例阻止启动）
+    mutex_handle: Option<HANDLE>,
     proxy: EventLoopProxy<UserEvent>,
     open_id: MenuId,
     config_id: MenuId,
@@ -169,13 +169,12 @@ impl App {
                 if ready {
                     fail_count = 0;
                 } else if !starting.swap(true, Ordering::SeqCst) {
-                    // dsh 未运行且无启动流程：清理残留并保活拉起
+                    // dsh 未运行且无启动流程：保活拉起（端口被占时 flow 内自动清理）
                     spawn_startup_flow(
                         proxy.clone(),
                         starting.clone(),
                         quitting.clone(),
                         anim_running.clone(),
-                        true,
                         false,
                     );
                     fail_count += 1;
@@ -202,17 +201,22 @@ impl App {
         }
     }
 
-    /// 退出处理：停止守护与启动流程，多轮清理确保 dsh 被终结后退出
+    /// 退出处理：先隐藏托盘图标（立即反馈，避免用户以为点击未生效），
+    /// 提前释放单例互斥体（新实例可立即启动），停止守护与动画，
+    /// 退出处理：Job 秒杀 dsh 后退出（KILL_ON_JOB_CLOSE 兜底崩溃场景）
     fn handle_quit(&mut self, event_loop: &ActiveEventLoop) {
         self.quitting.store(true, Ordering::SeqCst);
-        // 最多三轮：终结 dsh → 检查端口 → 若仍有实例（如刚被拉起的）再终结
-        for _ in 0..3 {
-            dsh::stop_harness();
-            if !dsh::port_ready() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(1000));
+        // 立即隐藏托盘图标 + 停止动画（即时反馈）
+        let _ = self.tray.set_visible(false);
+        set_anim(&self.anim_running, false, &self.proxy);
+        // 提前释放单例互斥体：此时进程尚未退出，但新实例可以立即启动
+        // （新实例的 watchdog 会自动接管 dsh 状态，旧进程仅剩清理收尾）
+        if let Some(handle) = self.mutex_handle.take() {
+            dsh::release_single_instance(handle);
         }
+        // 终结 dsh：Job 秒杀整个进程树（毫秒级），内部兜底外部残留；
+        // quitting=true 已让 watchdog/flow 放弃，KILL_ON_JOB_CLOSE 兜底崩溃场景
+        dsh::stop_harness();
         event_loop.exit();
     }
 }
@@ -241,8 +245,8 @@ impl ApplicationHandler<UserEvent> for App {
                     // 配置：资源管理器打开 dsh 配置目录 ~/.dsh（复用既有窗口）
                     let _ = dsh::open_config_dir();
                 } else if ev.id() == &self.restart_id {
-                    // 重启：立即让滚动条流动，异步终结 dsh，
-                    // 守护线程拉起后就绪自动停止动画并打开页面
+                    // 重启：立即让扫描灯流动（动画由主线程事件循环驱动，
+                    // 终结 dsh 必须在后台线程执行，避免阻塞主线程导致动画延迟）
                     set_anim(&self.anim_running, true, &self.proxy);
                     self.pending_open.store(true, Ordering::SeqCst);
                     thread::spawn(|| dsh::stop_harness());
@@ -347,9 +351,10 @@ fn load_tray_icons() -> Result<TrayIcons, Box<dyn Error>> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // 单实例保护：已有 DshLauncher 在运行时，本实例直接退出
-    let _guard = match dsh::single_instance_guard() {
-        Some(handle) => handle,
+    // 单实例保护：已有 DshLauncher 在运行时，本实例直接退出；
+    // 句柄存入 App，退出时提前释放以便新实例立即启动
+    let mutex_handle = match dsh::single_instance_guard() {
+        Some(handle) => Some(handle),
         None => return Ok(()),
     };
 
@@ -399,6 +404,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         starting: Arc::new(AtomicBool::new(false)),
         pending_open: Arc::new(AtomicBool::new(false)),
         quitting: Arc::new(AtomicBool::new(false)),
+        mutex_handle,
         proxy,
         open_id,
         config_id,

@@ -21,10 +21,57 @@ fn main() {
         .join("DeepSeekHarness-WhaleGirl.ico");
     assert!(ico_path.is_file(), "图标文件不存在：{}", ico_path.display());
 
-    // 动态生成 rc 文件（含图标绝对路径）
+    // 版本号取自 Cargo.toml（如 1.0.0 → FILEVERSION 1,0,0,0）
+    let pkg_version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "1.0.0".to_string());
+    let vparts: Vec<u32> = pkg_version
+        .split('.')
+        .map(|s| s.parse().unwrap_or(0))
+        .collect();
+    let (v1, v2, v3) = (
+        vparts.first().copied().unwrap_or(1),
+        vparts.get(1).copied().unwrap_or(0),
+        vparts.get(2).copied().unwrap_or(0),
+    );
+
+    // 动态生成 rc 文件：应用图标 + 版本信息资源（VS_VERSION_INFO）。
+    // 注意：VALUE 字符串用英文，避免 rc.exe 对无 BOM UTF-8 中文的 ANSI 误读乱码
+    let rc_content = format!(
+        r#"
+1 ICON "{ico}"
+
+1 VERSIONINFO
+FILEVERSION    {v1},{v2},{v3},0
+PRODUCTVERSION {v1},{v2},{v3},0
+FILEOS         0x40004
+FILETYPE       0x1
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "DshLauncher"
+            VALUE "FileDescription",  "DeepSeek Harness Tray Guardian"
+            VALUE "FileVersion",      "{v1}.{v2}.{v3}.0"
+            VALUE "InternalName",     "DshLauncher"
+            VALUE "LegalCopyright",   "Copyright (C) 2026 DshLauncher"
+            VALUE "OriginalFilename", "DshLauncher.exe"
+            VALUE "ProductName",      "DshLauncher"
+            VALUE "ProductVersion",   "{v1}.{v2}.{v3}.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
+"#,
+        ico = ico_path.display(),
+        v1 = v1,
+        v2 = v2,
+        v3 = v3,
+    );
     let rc_file = Path::new(&out_dir).join("app.rc");
-    std::fs::write(&rc_file, format!("1 ICON \"{}\"\n", ico_path.display()))
-        .expect("写入 app.rc 失败");
+    std::fs::write(&rc_file, rc_content).expect("写入 app.rc 失败");
 
     // 定位 rc.exe
     let rc_exe = find_rc_exe().expect(
