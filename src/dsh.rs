@@ -201,7 +201,7 @@ $shell = New-Object -ComObject Shell.Application
 $found = $false
 foreach ($w in $shell.Windows()) {{
     $loc = $w.LocationURL
-    if ($loc -and $loc.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {{
+    if ($loc -and $prefix -and $loc.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {{
         try {{
             # 激活既有窗口到前台（VS Code 行为）：恢复最小化 + 置前
             $hwnd = [IntPtr]$w.HWND
@@ -221,9 +221,8 @@ if (-not $found) {{ $null = $shell.Open($target) }}
 
 /// 构造停止 dsh 的 PowerShell 脚本（仅作为兜底：处理端口被外部进程占用、
 /// 非 Job 管理的残留；正常路径由 TerminateJobObject 秒杀，不走此脚本）：
-/// 按 Web 端口找监听进程并连同子进程树结束，再兜底清理 node 残留。
-/// safe_test=true（DSHLAUNCHER_SAFE_TEST=1）时仅按端口清理，跳过 node 匹配。
-fn stop_script_with(safe_test: bool, port: u16) -> String {
+/// 按 Web 端口找监听进程并连同子进程树结束。
+fn stop_script_with(port: u16) -> String {
     let port_part = r#"
 # 1) 结束监听 dsh 端口的进程及其子进程树
 netstat -ano | Select-String ("TCP\s+\S*:" + $port + "\s") | Select-String "LISTENING" | ForEach-Object {{
@@ -235,27 +234,15 @@ netstat -ano | Select-String ("TCP\s+\S*:" + $port + "\s") | Select-String "LIST
 }}
 "#
     .to_string();
-    let fallback_part = r#"
-# 2) 兜底：清理命令行指向 dsh 包的残留 node 进程
-Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -match 'deepseek-ai[\\/]dsh' } | ForEach-Object {
-    taskkill /PID $_.ProcessId /T /F 2>$null | Out-Null
-}
-"#
-    .to_string();
-    let mut script = format!(
+    format!(
         "$ErrorActionPreference = 'SilentlyContinue'\n$port = {}\n{}",
         port, port_part
-    );
-    if !safe_test {
-        script.push_str(&fallback_part);
-    }
-    script
+    )
 }
 
-/// 构造停止 dsh 的 PowerShell 脚本（读取调试开关与当前端口）
+/// 构造停止 dsh 的 PowerShell 脚本（使用当前端口）
 fn stop_script() -> String {
-    let safe_test = std::env::var("DSHLAUNCHER_SAFE_TEST").as_deref() == Ok("1");
-    stop_script_with(safe_test, web_port())
+    stop_script_with(web_port())
 }
 
 /// 停止 dsh：优先 TerminateJobObject 秒杀整个进程树（毫秒级、无 PowerShell）；
@@ -448,26 +435,15 @@ mod tests {
 
     #[test]
     fn stop_script_keeps_regex_escapes() {
-        let s = stop_script_with(false, 3080);
+        let s = stop_script_with(3080);
         assert!(s.contains(r"TCP\s+\S*:"), "端口正则转义必须保留，实际：{s}");
-        assert!(
-            s.contains(r"deepseek-ai[\\/]dsh"),
-            "node 兜底正则必须保留双反斜杠，实际：{s}"
-        );
         assert!(s.contains("$port = 3080"));
     }
 
     #[test]
-    fn stop_script_safe_test_skips_node_fallback() {
-        let s = stop_script_with(true, 39999);
+    fn stop_script_uses_given_port() {
+        let s = stop_script_with(39999);
         assert!(s.contains("$port = 39999"));
-        assert!(!s.contains("node.exe"), "安全模式不应包含 node 清理段");
-    }
-
-    #[test]
-    fn stop_script_normal_includes_node_fallback() {
-        let s = stop_script_with(false, 3080);
-        assert!(s.contains("node.exe"));
     }
 
     #[test]

@@ -6,11 +6,12 @@ DeepSeek Harness（dsh）的 Windows 系统托盘守护启动器，Rust 编写�
 ## 项目概述
 
 - 作用：常驻系统托盘，作为 dsh 的守护程序（watchdog），保证 dsh 持续运行
-- 启动命令：`npx @deepseek-ai/dsh web`（后台隐藏窗口）
+- 启动命令：`npx -y @deepseek-ai/dsh web`（后台隐藏窗口，端口覆盖时附加 --port）
 - 技术栈：Rust 1.97 / tray-icon 0.19 / winit 0.30 / image 0.25 / windows-sys 0.59 / base64 0.22
 - 目录结构：
   - `src/main.rs`：托盘、菜单、watchdog、启动流程、动画
   - `src/dsh.rs`：dsh 进程控制（启动/停止/端口探测）、ShellExecuteW、COM 脚本、单实例
+  - `src/log.rs`：按天轮转文件日志（凌晨 4 点日界，保留 3 天）
   - `build.rs`：把 Icons 下的 ICO 嵌入 PE 资源（桌面 exe 图标）
   - `Icons/`：DeepSeekHarness-WhaleGirl.ico（256x256，唯一图标源）
   - `Cargo.toml`：bin 名 `DshLauncher`，release 带 lto+strip
@@ -18,13 +19,13 @@ DeepSeek Harness（dsh）的 Windows 系统托盘守护启动器，Rust 编写�
 ## 架构（守护模型）
 
 ### 状态标志（Arc<AtomicBool>，防重入）
-- `starting`：是否有启动流程进行中；`swap(true)` 抢锁，流程结束 `store(false)`
-- `pending_open`：启动期间用户请求"打开页面"的待办；`AnimationDone` 时 `swap(false)` 消费
+- `starting`：是否有启动流程进行中；`swap(true)` 抢锁，流程结束由 `StartingGuard`（RAII）自动释放
+- `pending_open`：启动期间用户请求"打开页面"的待办；`AnimationDone` 就绪时消费；`pending_from_restart` 标记来源，重启失败时清除待办（打开来源保留）
 - `quitting`：退出请求；watchdog 与启动流程各阶段检查后立即放弃
 
 ### 守护线程（App::spawn_watchdog）
 - 每 2 秒探测 dsh 端口；连续拉起失败 3 次后放慢到 30 秒
-- dsh 未运行且无启动流程 → `spawn_startup_flow(restart=true, open=false)`（含清理残留）
+- dsh 未运行且无启动流程 → `spawn_startup_flow(proxy, starting, quitting, anim_running)`（含清理残留）
 - 启动器启动时 dsh 已在运行（端口连通）→ 直接复用，不杀不重启
 
 ### 启动流程（spawn_startup_flow）
@@ -32,18 +33,18 @@ DeepSeek Harness（dsh）的 Windows 系统托盘守护启动器，Rust 编写�
 - 启动前仅当 `port_occupied()`（bind 探测失败 = 端口被外部进程占，毫秒级）才 `stop_harness()`（TerminateJobObject 秒杀 + 兜底脚本）
 - `start_harness()`（仅一次）→ 轮询端口就绪（500ms 间隔，最长 120s）
 - 动画由独立动画线程驱动（见"动画策略"），flow 不负责换帧
-- 结束：`starting=false` → 就绪时停动画 → 发 `AnimationDone` 事件 → 主线程按 `open_when_ready || pending_open` 打开页面
+- 结束：`starting` 自动释放 → 就绪时停动画 → 发 `AnimationDone { ready }` → 主线程按 `pending_open` 待办打开页面（重启来源的待办在失败时清除）
 - 停止 dsh = `TerminateJobObject`（毫秒级，替代原 PowerShell stop 的 1~3 秒）；stop_script 仅作外部残留兜底
 
 ### 事件流
 - 菜单/托盘事件：`MenuEvent::set_event_handler` / `TrayIconEvent::set_event_handler` → `EventLoopProxy::send_event` → `ApplicationHandler::user_event`
-- 自定义事件：`Menu` / `Tray` / `AnimationTick`（换一帧）/ `AnimationDone { ready, open_when_ready }`
+- 自定义事件：`Menu` / `Tray` / `AnimationTick`（换一帧）/ `AnimationStop` / `AnimationDone { ready }` / `TooltipUpdate { ready }`
 
 ### 菜单行为
 - 打开：端口通 → `open_page()`；不通 → `pending_open=true` + 立即 `set_anim(true)`，watchdog 拉起后就绪自动打开
 - 配置：`open_config_dir()`（见下）
 - 重启：点击瞬间 `set_anim(true)`（扫描灯立即流动）+ `pending_open=true` + `thread::spawn(|| stop_harness())`（**必须异步**：动画换帧依赖主线程事件循环，同步执行带 sleep 的 stop 会阻塞主线程导致动画延迟出现），watchdog 拉起，flow 就绪后停动画并打开页面
-- 退出：`quitting=true` → 隐藏托盘图标（即时反馈）→ 停止动画 → **提前 `CloseHandle` 释放单例互斥体**（新实例可立即启动）→ `stop_harness()`（Job 秒杀，单次即可；KILL_ON_JOB_CLOSE 兜底崩溃场景）→ `event_loop.exit()`
+- 退出：`quitting=true` → 隐藏托盘图标（即时反馈）→ 停止动画 → **提前 `CloseHandle` 释放单例互斥体**（新实例可立即启动）→ `event_loop.exit()`；`stop_harness()`（Job 秒杀 + 外部残留兜底）在 `run_app` 返回后执行，避免阻塞事件循环（KILL_ON_JOB_CLOSE 兜底崩溃/异常退出场景）
   - 背景：若不提前释放，图标隐藏到进程退出的窗口期内新实例会被单例拒绝启动（用户会以为程序没响应）
 - 左键单击无功能（`with_menu_on_left_click(false)`）；左键双击等同"打开"
 
@@ -66,14 +67,13 @@ DeepSeek Harness（dsh）的 Windows 系统托盘守护启动器，Rust 编写�
 ### windows-sys 0.59 要点
 - `w!` 宏返回裸指针 `*const u16`（不是切片），直接传参：`CreateMutexW(null(), 1, name)`
 - `CreateMutexW` 被 `cfg(feature = "Win32_Security")` 门控；`ShellExecuteW` 需要 feature `Win32_UI_Shell`
-- Cargo.toml features：`Win32_Foundation` + `Win32_System_Threading` + `Win32_Security` + `Win32_UI_Shell`
+- Cargo.toml features：`Win32_Foundation` + `Win32_System_Threading` + `Win32_Security` + `Win32_UI_Shell` + `Win32_System_JobObjects` + `Win32_System_IO` + `Win32_System_SystemInformation` + `Win32_UI_WindowsAndMessaging`
 - `ShellExecuteW` 返回 HINSTANCE，`as isize > 32` 表示成功（打开 URL 无黑框，替代 cmd start）
 
 ### PowerShell 调用（dsh.rs）
 - 一律 `-EncodedCommand`（UTF-16LE + Base64 编码脚本），彻底避免命令行转义问题
-- 启动进程加 `creation_flags(0x0800_0000)`（CREATE_NO_WINDOW）不弹控制台
-- 杀 dsh：netstat 按端口找监听 PID → `taskkill /PID x /T /F`（杀进程树）；兜底匹配 node 命令行 `deepseek-ai[\\/]dsh`
-- 调试开关 `DSHLAUNCHER_SAFE_TEST=1`：stop 仅按端口清理，跳过全局 node 匹配（开发机安全测试用）
+- 启动进程加 `creation_flags(CREATE_NO_WINDOW)`（windows-sys 常量）不弹控制台
+- 杀 dsh：netstat 按端口找监听 PID → `taskkill /PID x /T /F`（杀进程树）
 - 端口 `DSHLAUNCHER_PORT` 环境变量可覆盖默认 3080
 
 ### 打开资源管理器复用窗口（VS Code 方案）
@@ -112,11 +112,10 @@ DeepSeek Harness（dsh）的 Windows 系统托盘守护启动器，Rust 编写�
 - 在用户实例运行时直接启动测试实例（单实例互斥体会让测试实例退出）
 - **测试脚本内的清理动作同样遵守**：写完脚本先检查其中是否含 `Stop-Process -Name` 之类的宽泛匹配（曾写出含 `Stop-Process -Name node` 的测试脚本，发现后立即删除）
 
-**安全测试组合（四要素）：**
+**安全测试组合（三要素）：**
 1. `DSHLAUNCHER_PORT=39999`（隔离端口）
-2. `DSHLAUNCHER_SAFE_TEST=1`（stop 仅按端口清理，跳过 node 匹配）
-3. `DSHLAUNCHER_INSTANCE=test`（互斥体后缀隔离，测试实例与用户实例共存）
-4. `PATH` 前置假 npx（`scripts/test-bin/npx.cmd`：`ping -n 60 127.0.0.1 >nul` 模拟 60 秒启动）
+2. `DSHLAUNCHER_INSTANCE=test`（互斥体后缀隔离，测试实例与用户实例共存）
+3. `PATH` 前置假 npx（`scripts/test-bin/npx.cmd`：`ping -n 60 127.0.0.1 >nul` 模拟 60 秒启动）
 
 **清理规则：** 一律 `Start-Process -PassThru` 拿 PID 按 `Stop-Process -Id` 清理；端口进程用 `netstat -ano | findstr :39999` 定位 PID。测试后必须确认用户实例仍存活。
 
@@ -134,7 +133,7 @@ DeepSeek Harness（dsh）的 Windows 系统托盘守护启动器，Rust 编写�
 
 ## 调试经验（踩坑实录）
 
-- **测试掩盖静默失效**：杀 dsh 的正则被 JS 转义破坏后，测试从未暴露——因为测试场景（39999 无监听者）下 stop 无操作也"通过"。教训：测试要覆盖"真实杀伤"路径（先起假监听进程再杀），不能只测"无目标时不出错"
+- **测试掩盖静默失效**：杀 dsh 的正则被 JS 转义破坏后，测试从未暴露——因为测试场景（39999 无监听者）下 stop 无操作也"通过"。教训：测试要覆盖"真实杀伤"路径（先起假监听进程再杀），不能只测"无目标时不出错"。**已固化**：`stop_script_keeps_regex_escapes` 快照测试按字节断言正则转义
 - **验证写入内容用 grep 看实际行**，不要用 PowerShell 正则/Contains 验证（验证命令自身的转义和单引号不转义规则会误导；grep 直接显示文件真实字节最可靠）
 - **假进程用脚本文件而非内联参数**：`Start-Process node -ArgumentList '-e','require(...)'` 的参数拼接经常失败（假 dsh 起不来、断言全废）；用 write 工具写 `fake-dsh.js`/`npx.cmd` 文件再启动，稳定可靠
 - **工具调用被中断后**：先确认外部状态（文件/进程/端口）再决定重试——中断的调用结果未知，幂等操作可重试，有副作用的先验证
