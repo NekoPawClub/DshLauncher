@@ -1,0 +1,21 @@
+[package]
+name = "dsh-launcher"
+version = "0.1.0"
+edition = "2021"
+description = "DeepSeek Harness 系统托盘启动器（DshLauncher）"
+
+[[bin]]
+name = "DshLauncher"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+strip = true
+
+[dependencies]
+tray-icon = "0.19"
+winit = "0.30"
+image = "0.25"
+base64 = "0.22"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security", "Win32_UI_Shell"] }
