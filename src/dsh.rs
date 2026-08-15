@@ -5,9 +5,9 @@ use std::net::TcpStream;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command};
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 use windows_sys::Win32::System::JobObjects::{
@@ -15,19 +15,24 @@ use windows_sys::Win32::System::JobObjects::{
     SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
-use windows_sys::Win32::System::Threading::{CreateMutexW, IO_COUNTERS};
+use windows_sys::Win32::System::Threading::{CreateMutexW, CREATE_NO_WINDOW, IO_COUNTERS};
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
+use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 /// dsh Web 默认端口（dsh web 默认监听 3080）
 pub const DEFAULT_PORT: u16 = 3080;
 
-/// 获取 dsh Web 端口：优先读取环境变量 DSHLAUNCHER_PORT，否则使用默认值
-pub fn web_port() -> u16 {
-    std::env::var("DSHLAUNCHER_PORT")
-        .ok()
+/// 从环境变量字符串解析端口（无效/0/超范围回退默认值）
+fn port_from_env(value: Option<&str>) -> u16 {
+    value
         .and_then(|v| v.trim().parse::<u16>().ok())
         .filter(|p| *p > 0)
         .unwrap_or(DEFAULT_PORT)
+}
+
+/// 获取 dsh Web 端口：优先读取环境变量 DSHLAUNCHER_PORT，否则使用默认值
+pub fn web_port() -> u16 {
+    port_from_env(std::env::var("DSHLAUNCHER_PORT").ok().as_deref())
 }
 
 /// dsh 操作页面地址
@@ -47,18 +52,34 @@ fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// 检查指定端口当前是否可连接（运行中）
+fn port_ready_at(port: u16) -> bool {
+    use std::net::SocketAddr;
+    // connect_timeout：避免回环被防火墙 DROP 时探测挂起拖慢 watchdog（FIXLIST P1-5）
+    TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(500),
+    )
+    .is_ok()
+}
+
 /// 检查 dsh 端口当前是否可连接（运行中）
 pub fn port_ready() -> bool {
-    TcpStream::connect(("127.0.0.1", web_port())).is_ok()
+    port_ready_at(web_port())
+}
+
+/// 检查指定端口是否被占用（不可连接但 bind 失败 = 有残留进程占着端口）
+fn port_occupied_at(port: u16) -> bool {
+    !port_ready_at(port) && std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
 }
 
 /// 检查 dsh 端口是否被占用（不可连接但 bind 失败 = 有残留进程占着端口）。
 /// bind 探测毫秒级、无 PowerShell 开销。
 pub fn port_occupied() -> bool {
-    !port_ready() && std::net::TcpListener::bind(("127.0.0.1", web_port())).is_err()
+    port_occupied_at(web_port())
 }
 
-/// HANDLE 的 Send+Sync 包装（OnceLock 静态变量要求裸指针可跨线程共享）
+/// HANDLE 的 Send+Sync 包装（静态 Mutex 变量要求裸指针可跨线程共享）
 struct JobHandle(HANDLE);
 unsafe impl Send for JobHandle {}
 unsafe impl Sync for JobHandle {}
@@ -67,12 +88,18 @@ unsafe impl Sync for JobHandle {}
 /// 设置 KILL_ON_JOB_CLOSE：DshLauncher 进程退出（含崩溃/被强杀）时，
 /// Windows 自动终止 Job 内所有进程 —— 从设计上保证不会遗留孤儿 dsh，
 /// 因此常态启动/退出无需"清理残留"流程。
+/// 创建失败不缓存：下次调用重新尝试（FIXLIST P1-6）。
 fn job_handle() -> Option<HANDLE> {
-    static JOB: OnceLock<JobHandle> = OnceLock::new();
-    let handle = JOB.get_or_init(|| unsafe {
+    static JOB: Mutex<Option<JobHandle>> = Mutex::new(None);
+    let mut guard = JOB.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(jh) = guard.as_ref() {
+        return Some(jh.0);
+    }
+    unsafe {
         let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
         if job.is_null() {
-            return JobHandle(job);
+            crate::log::error("CreateJobObjectW 失败（Job 不可用，dsh 将无法被自动回收）");
+            return None;
         }
         let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
             BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
@@ -99,16 +126,20 @@ fn job_handle() -> Option<HANDLE> {
             PeakProcessMemoryUsed: 0,
             PeakJobMemoryUsed: 0,
         };
-        let _ = SetInformationJobObject(
+        if SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,
             &info as *const _ as *const core::ffi::c_void,
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        );
-        JobHandle(job)
-    })
-    .0;
-    (!handle.is_null()).then_some(handle)
+        ) == 0
+        {
+            crate::log::error(
+                "SetInformationJobObject 失败（KILL_ON_JOB_CLOSE 未生效，dsh 退出时可能残留）",
+            );
+        }
+        *guard = Some(JobHandle(job));
+        Some(job)
+    }
 }
 
 /// 用系统默认方式（ShellExecuteW）打开 dsh 操作页面，不产生任何控制台窗口
@@ -122,7 +153,7 @@ pub fn open_page() -> io::Result<()> {
             url_wide.as_ptr(), // 目标：URL
             std::ptr::null(),  // 无参数
             std::ptr::null(),  // 无工作目录
-            1,                 // SW_SHOWNORMAL
+            SW_SHOWNORMAL,
         );
         // 返回值大于 32 表示成功
         if result as isize > 32 {
@@ -179,13 +210,9 @@ if (-not $found) {{ $null = $shell.Open($target) }}
 /// 构造停止 dsh 的 PowerShell 脚本（仅作为兜底：处理端口被外部进程占用、
 /// 非 Job 管理的残留；正常路径由 TerminateJobObject 秒杀，不走此脚本）：
 /// 按 Web 端口找监听进程并连同子进程树结束，再兜底清理 node 残留。
-/// 调试开关：DSHLAUNCHER_SAFE_TEST=1 时仅按端口清理，跳过 node 匹配。
-fn stop_script() -> String {
-    let safe_test = std::env::var("DSHLAUNCHER_SAFE_TEST").as_deref() == Ok("1");
-    let port = web_port();
-
-    let port_part = format!(
-        r#"
+/// safe_test=true（DSHLAUNCHER_SAFE_TEST=1）时仅按端口清理，跳过 node 匹配。
+fn stop_script_with(safe_test: bool, port: u16) -> String {
+    let port_part = r#"
 # 1) 结束监听 dsh 端口的进程及其子进程树
 netstat -ano | Select-String ("TCP\s+\S*:" + $port + "\s") | Select-String "LISTENING" | ForEach-Object {{
     $parts = ($_.ToString().Trim() -split '\s+')
@@ -195,29 +222,28 @@ netstat -ano | Select-String ("TCP\s+\S*:" + $port + "\s") | Select-String "LIST
     }}
 }}
 "#
-    );
+    .to_string();
     let fallback_part = r#"
 # 2) 兜底：清理命令行指向 dsh 包的残留 node 进程
 Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -match 'deepseek-ai[\\/]dsh' } | ForEach-Object {
     taskkill /PID $_.ProcessId /T /F 2>$null | Out-Null
 }
-"#;
-
-    if safe_test {
-        format!(
-            "$ErrorActionPreference = 'SilentlyContinue'
-$port = {}
-{}",
-            port, port_part
-        )
-    } else {
-        format!(
-            "$ErrorActionPreference = 'SilentlyContinue'
-$port = {}
-{}{}",
-            port, port_part, fallback_part
-        )
+"#
+    .to_string();
+    let mut script = format!(
+        "$ErrorActionPreference = 'SilentlyContinue'\n$port = {}\n{}",
+        port, port_part
+    );
+    if !safe_test {
+        script.push_str(&fallback_part);
     }
+    script
+}
+
+/// 构造停止 dsh 的 PowerShell 脚本（读取调试开关与当前端口）
+fn stop_script() -> String {
+    let safe_test = std::env::var("DSHLAUNCHER_SAFE_TEST").as_deref() == Ok("1");
+    stop_script_with(safe_test, web_port())
 }
 
 /// 停止 dsh：优先 TerminateJobObject 秒杀整个进程树（毫秒级、无 PowerShell）；
@@ -227,44 +253,80 @@ pub fn stop_harness() {
     // 1) 秒杀 Job 内进程树
     if let Some(job) = job_handle() {
         unsafe {
-            let _ = TerminateJobObject(job, 1);
+            if TerminateJobObject(job, 1) == 0 {
+                crate::log::warn("TerminateJobObject 失败（Job 秒杀未生效）");
+            }
         }
     }
     // 2) 等终止生效，检查端口是否仍被占
     thread::sleep(Duration::from_millis(300));
     if port_ready() || port_occupied() {
+        crate::log::info("端口仍被占用，执行兜底清理脚本");
         if let Ok(mut child) = run_ps_hidden(&stop_script()) {
-            let _ = child.wait();
+            // 兜底脚本最多等 5 秒，超时强杀，避免退出流程卡死（FIXLIST P1-2）
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    crate::log::warn("兜底清理脚本超时，已强制终止");
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
         }
     }
 }
 
 /// 后台隐藏窗口启动 dsh：npx @deepseek-ai/dsh web（工作目录为用户主目录）。
+/// 端口覆盖时透传 --port（FIXLIST P0-1）；-y 避免 npx 首次安装的交互确认（P0-3）。
 /// 启动后立即把进程树挂入全局 Job（KILL_ON_JOB_CLOSE）。
 pub fn start_harness() -> io::Result<()> {
     let home = home_dir();
+    let port = web_port();
+    let web_cmd = if port == DEFAULT_PORT {
+        "npx -y @deepseek-ai/dsh web".to_string()
+    } else {
+        format!("npx -y @deepseek-ai/dsh web --port {port}")
+    };
     let script = format!(
-        "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c','npx @deepseek-ai/dsh web' -WorkingDirectory '{home}' -WindowStyle Hidden"
+        "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c','{web_cmd}' -WorkingDirectory '{home}' -WindowStyle Hidden"
     );
-    let child = run_ps_hidden(&script)?;
+    let mut child = run_ps_hidden(&script)?;
     // 挂入 Job：DshLauncher 退出/崩溃时自动终止 dsh，不留孤儿
     if let Some(job) = job_handle() {
         use std::os::windows::io::AsRawHandle;
         unsafe {
-            let _ = AssignProcessToJobObject(job, child.as_raw_handle());
+            // 挂接失败：dsh 将成孤儿，视为启动失败并终止刚启动的进程（FIXLIST P1-4）
+            if AssignProcessToJobObject(job, child.as_raw_handle()) == 0 {
+                let err = io::Error::last_os_error();
+                crate::log::error(&format!(
+                    "AssignProcessToJobObject 失败（dsh 将无法被 Job 回收）：{err}"
+                ));
+                let _ = child.kill();
+                return Err(err);
+            }
         }
     }
+    crate::log::info(&format!("已启动 dsh（{web_cmd}）并挂入 Job"));
     Ok(())
+}
+
+/// 把字符串编码为 UTF-16LE 字节序列（-EncodedCommand 用）
+fn utf16le_bytes(s: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(s.len() * 2);
+    for unit in s.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
 }
 
 /// 将 PowerShell 脚本编码为 UTF-16LE + Base64（-EncodedCommand 免转义）
 fn ps_encoded(script: &str) -> String {
     use base64::Engine;
-    let mut bytes: Vec<u8> = Vec::with_capacity(script.len() * 2);
-    for unit in script.encode_utf16() {
-        bytes.extend_from_slice(&unit.to_le_bytes());
-    }
-    base64::engine::general_purpose::STANDARD.encode(bytes)
+    base64::engine::general_purpose::STANDARD.encode(utf16le_bytes(script))
 }
 
 /// 以隐藏窗口（CREATE_NO_WINDOW）方式启动 PowerShell 进程执行脚本
@@ -278,7 +340,7 @@ fn run_ps_hidden(script: &str) -> io::Result<Child> {
             "-EncodedCommand",
             &ps_encoded(script),
         ])
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW：不弹出任何控制台窗口
+        .creation_flags(CREATE_NO_WINDOW) // 不弹出任何控制台窗口
         .spawn()
 }
 
@@ -306,5 +368,80 @@ pub fn single_instance_guard() -> Option<HANDLE> {
             return None;
         }
         Some(handle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_from_env_parses_valid() {
+        assert_eq!(port_from_env(Some("39999")), 39999);
+        assert_eq!(port_from_env(Some(" 8080 ")), 8080);
+    }
+
+    #[test]
+    fn port_from_env_rejects_invalid() {
+        assert_eq!(port_from_env(Some("abc")), DEFAULT_PORT);
+        assert_eq!(port_from_env(Some("0")), DEFAULT_PORT);
+        assert_eq!(port_from_env(Some("70000")), DEFAULT_PORT);
+        assert_eq!(port_from_env(Some("")), DEFAULT_PORT);
+        assert_eq!(port_from_env(None), DEFAULT_PORT);
+    }
+
+    #[test]
+    fn to_wide_encodes_and_terminates() {
+        assert_eq!(to_wide("ab中"), vec![0x61, 0x62, 0x4e2d, 0]);
+    }
+
+    #[test]
+    fn ps_encoded_roundtrip() {
+        use base64::Engine;
+        let s = "中文 '引号' \\反斜杠\n多行";
+        let enc = ps_encoded(s);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(enc)
+            .unwrap();
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(String::from_utf16(&units).unwrap(), s);
+    }
+
+    #[test]
+    fn stop_script_keeps_regex_escapes() {
+        let s = stop_script_with(false, 3080);
+        assert!(s.contains(r"TCP\s+\S*:"), "端口正则转义必须保留，实际：{s}");
+        assert!(
+            s.contains(r"deepseek-ai[\\/]dsh"),
+            "node 兜底正则必须保留双反斜杠，实际：{s}"
+        );
+        assert!(s.contains("$port = 3080"));
+    }
+
+    #[test]
+    fn stop_script_safe_test_skips_node_fallback() {
+        let s = stop_script_with(true, 39999);
+        assert!(s.contains("$port = 39999"));
+        assert!(!s.contains("node.exe"), "安全模式不应包含 node 清理段");
+    }
+
+    #[test]
+    fn stop_script_normal_includes_node_fallback() {
+        let s = stop_script_with(false, 3080);
+        assert!(s.contains("node.exe"));
+    }
+
+    #[test]
+    fn port_probe_semantics() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(port_ready_at(port), "监听中应就绪");
+        assert!(!port_occupied_at(port), "监听中不算被占");
+        drop(listener);
+        assert!(!port_ready_at(port), "释放后应未就绪");
+        assert!(!port_occupied_at(port), "释放后可 bind，不算被占");
     }
 }

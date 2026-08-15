@@ -89,6 +89,7 @@ END
     // 将生成的 .res 交给链接器
     println!("cargo:rustc-link-arg={}", res_file.display());
     println!("cargo:rerun-if-changed=Icons/DeepSeekHarness-WhaleGirl.ico");
+    println!("cargo:rerun-if-env-changed=RC_EXE");
 }
 
 /// 依次尝试：环境变量 RC_EXE → PATH → Windows Kits → VS 安装目录
@@ -123,7 +124,8 @@ fn find_rc_exe() -> Option<PathBuf> {
                 .filter_map(|e| e.ok())
                 .filter_map(|e| e.file_name().into_string().ok())
                 .collect();
-            versions.sort();
+            // 按版本号数值比较（"11.0" 必须大于 "9.0"），选最新 SDK
+            versions.sort_by_key(|a| version_key(a));
             for version in versions.iter().rev() {
                 for arch in ["x64", "x86", "arm64"] {
                     let p = Path::new(kits_root).join(version).join(arch).join("rc.exe");
@@ -149,6 +151,11 @@ fn find_rc_exe() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// 版本字符串 → 数值序列（"10.0.22621.0" → [10, 0, 22621, 0]），用于正确选取最新 SDK
+fn version_key(s: &str) -> Vec<u32> {
+    s.split('.').filter_map(|p| p.parse::<u32>().ok()).collect()
 }
 
 /// 在目录树下有限深度内查找指定文件名
