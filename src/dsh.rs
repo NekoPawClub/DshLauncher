@@ -5,6 +5,7 @@ use std::net::TcpStream;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -52,10 +53,16 @@ fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// 转义 PowerShell 单引号字符串内的单引号（单引号双写），
+/// 防止路径含单引号（如用户名 O'Reilly）破坏脚本字符串
+fn ps_quote_escape(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
 /// 检查指定端口当前是否可连接（运行中）
 fn port_ready_at(port: u16) -> bool {
     use std::net::SocketAddr;
-    // connect_timeout：避免回环被防火墙 DROP 时探测挂起拖慢 watchdog（FIXLIST P1-5）
+    // connect_timeout：避免回环被防火墙 DROP 时探测挂起拖慢 watchdog
     TcpStream::connect_timeout(
         &SocketAddr::from(([127, 0, 0, 1], port)),
         Duration::from_millis(500),
@@ -88,7 +95,7 @@ unsafe impl Sync for JobHandle {}
 /// 设置 KILL_ON_JOB_CLOSE：DshLauncher 进程退出（含崩溃/被强杀）时，
 /// Windows 自动终止 Job 内所有进程 —— 从设计上保证不会遗留孤儿 dsh，
 /// 因此常态启动/退出无需"清理残留"流程。
-/// 创建失败不缓存：下次调用重新尝试（FIXLIST P1-6）。
+/// 创建失败不缓存：下次调用重新尝试。
 fn job_handle() -> Option<HANDLE> {
     static JOB: Mutex<Option<JobHandle>> = Mutex::new(None);
     let mut guard = JOB.lock().unwrap_or_else(|p| p.into_inner());
@@ -133,9 +140,12 @@ fn job_handle() -> Option<HANDLE> {
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         ) == 0
         {
+            // KILL_ON_JOB_CLOSE 未生效时该 Job 无回收能力：不缓存，释放后下次重试
             crate::log::error(
                 "SetInformationJobObject 失败（KILL_ON_JOB_CLOSE 未生效，dsh 退出时可能残留）",
             );
+            CloseHandle(job);
+            return None;
         }
         *guard = Some(JobHandle(job));
         Some(job)
@@ -169,11 +179,14 @@ pub fn open_page() -> io::Result<()> {
 /// 未找到时才新建窗口。
 pub fn open_config_dir() -> io::Result<()> {
     let dir = Path::new(&home_dir()).join(".dsh");
-    let dir_str = dir.to_string_lossy().to_string();
+    let dir_str = ps_quote_escape(&dir.to_string_lossy());
     let script = format!(
         r#"
 $ErrorActionPreference = 'SilentlyContinue'
 $target = '{dir}'
+# Uri 编码后与资源管理器 LocationURL 格式一致（空格/特殊字符百分号编码）
+$uri = New-Object System.Uri($target)
+$prefix = $uri.AbsoluteUri
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -185,7 +198,6 @@ public class Win32Activate {{
 }}
 "@
 $shell = New-Object -ComObject Shell.Application
-$prefix = 'file:///' + ($target -replace '\\','/')
 $found = $false
 foreach ($w in $shell.Windows()) {{
     $loc = $w.LocationURL
@@ -263,7 +275,7 @@ pub fn stop_harness() {
     if port_ready() || port_occupied() {
         crate::log::info("端口仍被占用，执行兜底清理脚本");
         if let Ok(mut child) = run_ps_hidden(&stop_script()) {
-            // 兜底脚本最多等 5 秒，超时强杀，避免退出流程卡死（FIXLIST P1-2）
+            // 兜底脚本最多等 5 秒，超时强杀，避免退出流程卡死
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 if child.try_wait().ok().flatten().is_some() {
@@ -281,9 +293,10 @@ pub fn stop_harness() {
 }
 
 /// 后台隐藏窗口启动 dsh：npx @deepseek-ai/dsh web（工作目录为用户主目录）。
-/// 端口覆盖时透传 --port（FIXLIST P0-1）；-y 避免 npx 首次安装的交互确认（P0-3）。
+/// 端口覆盖时透传 --port；-y 避免 npx 首次安装的交互确认。
 /// 启动后立即把进程树挂入全局 Job（KILL_ON_JOB_CLOSE）。
-pub fn start_harness() -> io::Result<()> {
+/// quitting：退出请求标志，spawn 后立即检查，避免退出竞态导致进程树漏挂 Job。
+pub fn start_harness(quitting: &AtomicBool) -> io::Result<()> {
     let home = home_dir();
     let port = web_port();
     let web_cmd = if port == DEFAULT_PORT {
@@ -291,23 +304,39 @@ pub fn start_harness() -> io::Result<()> {
     } else {
         format!("npx -y @deepseek-ai/dsh web --port {port}")
     };
+    let home_esc = ps_quote_escape(&home);
     let script = format!(
-        "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c','{web_cmd}' -WorkingDirectory '{home}' -WindowStyle Hidden"
+        "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c','{web_cmd}' -WorkingDirectory '{home_esc}' -WindowStyle Hidden"
     );
     let mut child = run_ps_hidden(&script)?;
-    // 挂入 Job：DshLauncher 退出/崩溃时自动终止 dsh，不留孤儿
-    if let Some(job) = job_handle() {
-        use std::os::windows::io::AsRawHandle;
-        unsafe {
-            // 挂接失败：dsh 将成孤儿，视为启动失败并终止刚启动的进程（FIXLIST P1-4）
-            if AssignProcessToJobObject(job, child.as_raw_handle()) == 0 {
-                let err = io::Error::last_os_error();
-                crate::log::error(&format!(
-                    "AssignProcessToJobObject 失败（dsh 将无法被 Job 回收）：{err}"
-                ));
-                let _ = child.kill();
-                return Err(err);
+    // 退出竞态加固：spawn 后若收到退出请求，立即终止刚启动的进程，
+    // 避免 Job 挂接前退出导致 main 尾部清理漏杀此进程树
+    if quitting.load(Ordering::SeqCst) {
+        let _ = child.kill();
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "收到退出请求"));
+    }
+    // 挂入 Job：DshLauncher 退出/崩溃时自动终止 dsh，不留孤儿。
+    // Job 不可用（创建或配置失败）时拒绝启动：dsh 无法被回收 = 孤儿，不允许放行
+    match job_handle() {
+        Some(job) => {
+            use std::os::windows::io::AsRawHandle;
+            unsafe {
+                // 挂接失败：dsh 将成孤儿，视为启动失败并终止刚启动的进程
+                if AssignProcessToJobObject(job, child.as_raw_handle()) == 0 {
+                    let err = io::Error::last_os_error();
+                    crate::log::error(&format!(
+                        "AssignProcessToJobObject 失败（dsh 将无法被 Job 回收）：{err}"
+                    ));
+                    let _ = child.kill();
+                    return Err(err);
+                }
             }
+        }
+        None => {
+            let _ = child.kill();
+            return Err(io::Error::other(
+                "Job 对象不可用（dsh 将无法被自动回收），拒绝启动",
+            ));
         }
     }
     crate::log::info(&format!("已启动 dsh（{web_cmd}）并挂入 Job"));
@@ -393,6 +422,13 @@ mod tests {
     #[test]
     fn to_wide_encodes_and_terminates() {
         assert_eq!(to_wide("ab中"), vec![0x61, 0x62, 0x4e2d, 0]);
+    }
+
+    #[test]
+    fn ps_quote_escape_handles_quotes() {
+        assert_eq!(ps_quote_escape("plain"), "plain");
+        assert_eq!(ps_quote_escape("O'Reilly"), "O''Reilly");
+        assert_eq!(ps_quote_escape("a'b'c"), "a''b''c");
     }
 
     #[test]

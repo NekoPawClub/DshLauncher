@@ -41,3 +41,4 @@ DeepSeek Harness（dsh）的 Windows 系统托盘启动器，使用 Rust 编写�
 - 托盘图标与可执行文件图标均来自 `Icons/DeepSeekHarness-WhaleGirl.ico`
 - 图标来源：[deepseek-whale-girl-icon](https://github.com/fornarwhal/deepseek-whale-girl-icon.git)
 - 单实例：重复启动会自动退出
+- 运行日志：写入 `%USERPROFILE%\.dsh\launcher-YYYY-MM-DD.log`（按天轮转，凌晨 4 点分割，仅保留最近 3 天；测试实例自动带后缀）；可用环境变量 `DSHLAUNCHER_LOG_DIR` 覆盖日志目录

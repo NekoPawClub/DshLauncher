@@ -2,7 +2,7 @@
 //!
 //! 常驻系统托盘、无主窗口。托盘右键菜单：打开 / 配置 / 重启 / 退出；
 //! 左键单击无功能，左键双击等同"打开"。
-//! Harness 的启动命令固定为：npx @deepseek-ai/dsh web。
+//! Harness 的启动命令：npx -y @deepseek-ai/dsh web（端口覆盖时附加 --port）。
 //!
 //! 守护（watchdog）设计：
 //! - 常驻守护线程周期探测 dsh 端口：dsh 未运行即自动保活拉起
@@ -39,10 +39,9 @@ enum UserEvent {
     AnimationDone {
         ready: bool,
     },
-    /// tooltip 状态更新：dsh 运行状态显示（FIXLIST P3-4）
+    /// tooltip 状态更新：dsh 运行状态显示
     TooltipUpdate {
         ready: bool,
-        starting: bool,
     },
 }
 
@@ -57,7 +56,7 @@ fn set_anim(anim_running: &AtomicBool, running: bool, proxy: &EventLoopProxy<Use
 }
 
 /// RAII 守卫：离开作用域（含 panic 与提前 return）时释放 starting 标志，
-/// 防止 flow 线程异常退出后 watchdog 永久停摆（FIXLIST P1-1）。
+/// 防止 flow 线程异常退出后 watchdog 永久停摆。
 struct StartingGuard(Arc<AtomicBool>);
 
 impl Drop for StartingGuard {
@@ -89,10 +88,7 @@ fn spawn_startup_flow(
         }
         log::info("启动流程开始");
         // tooltip 立即显示"启动中"（watchdog 的下一次状态变化可能滞后 2 秒）
-        let _ = proxy.send_event(UserEvent::TooltipUpdate {
-            ready: false,
-            starting: true,
-        });
+        let _ = proxy.send_event(UserEvent::TooltipUpdate { ready: false });
 
         // 仅当端口被残留进程占用时清理（罕见：非 Job 管理的外部进程；
         // Job + KILL_ON_JOB_CLOSE 保证我们启动的 dsh 崩溃即释放端口，常态零清理）
@@ -110,7 +106,7 @@ fn spawn_startup_flow(
         }
 
         let mut ready = dsh::port_ready();
-        if !ready && dsh::start_harness().is_ok() {
+        if !ready && dsh::start_harness(&quitting).is_ok() {
             // 轮询端口就绪（500ms 间隔，最长 120 秒）
             let deadline = Instant::now() + Duration::from_secs(120);
             while !ready && Instant::now() < deadline && !quitting.load(Ordering::SeqCst) {
@@ -146,6 +142,8 @@ struct App {
     starting: Arc<AtomicBool>,
     /// 启动期间用户请求"打开页面"的待办标记
     pending_open: Arc<AtomicBool>,
+    /// 待办是否来自"重启"菜单（重启失败时清除待办，避免反复自动打开）
+    pending_from_restart: Arc<AtomicBool>,
     /// 退出请求标志：守护线程与启动流程据此停止
     quitting: Arc<AtomicBool>,
     /// 单实例互斥体句柄（退出时提前释放，避免新实例被单例阻止启动）
@@ -161,8 +159,12 @@ impl App {
     /// 动画线程：动画播放期间每 150ms 发送一帧换帧事件（不播放时仅轻量轮询）
     fn spawn_animator(&self) {
         let anim_running = self.anim_running.clone();
+        let quitting = self.quitting.clone();
         let proxy = self.proxy.clone();
         thread::spawn(move || loop {
+            if quitting.load(Ordering::SeqCst) {
+                break;
+            }
             if anim_running.load(Ordering::SeqCst) {
                 let _ = proxy.send_event(UserEvent::AnimationTick);
             }
@@ -191,10 +193,7 @@ impl App {
                     set_anim(&anim_running, !ready, &proxy);
                     was_ready = Some(ready);
                     // tooltip 同步运行状态（flow 进行中时显示"启动中"）
-                    let _ = proxy.send_event(UserEvent::TooltipUpdate {
-                        ready,
-                        starting: starting.load(Ordering::SeqCst),
-                    });
+                    let _ = proxy.send_event(UserEvent::TooltipUpdate { ready });
                     if ready {
                         log::info(&format!("dsh 就绪（端口 {} 可连接）", dsh::web_port()));
                     } else {
@@ -228,7 +227,7 @@ impl App {
         });
     }
 
-    /// 更新托盘 tooltip：反映 dsh 运行状态（FIXLIST P3-4）
+    /// 更新托盘 tooltip：反映 dsh 运行状态
     fn update_tooltip(&self, ready: bool, starting: bool) {
         let text = if ready {
             format!("DshLauncher — dsh 运行中（端口 {}）", dsh::web_port())
@@ -247,7 +246,10 @@ impl App {
             let _ = dsh::open_page();
         } else {
             self.pending_open.store(true, Ordering::SeqCst);
+            self.pending_from_restart.store(false, Ordering::SeqCst);
             set_anim(&self.anim_running, true, &self.proxy);
+            // 与动画同款即时反馈：tooltip 立即显示"启动中"
+            self.update_tooltip(false, true);
             log::info("dsh 未运行：登记打开待办，由 watchdog 拉起后就绪自动打开");
         }
     }
@@ -299,6 +301,9 @@ impl ApplicationHandler<UserEvent> for App {
                     log::info("用户请求重启 dsh");
                     set_anim(&self.anim_running, true, &self.proxy);
                     self.pending_open.store(true, Ordering::SeqCst);
+                    self.pending_from_restart.store(true, Ordering::SeqCst);
+                    // 与动画同款即时反馈：tooltip 立即显示"启动中"
+                    self.update_tooltip(false, true);
                     thread::spawn(dsh::stop_harness);
                 } else if ev.id() == &self.quit_id {
                     // 退出：终结 dsh 并停止守护后退出本程序
@@ -330,18 +335,24 @@ impl ApplicationHandler<UserEvent> for App {
                 set_anim(&self.anim_running, false, &self.proxy);
                 // flow 已结束（starting 已释放）：tooltip 显示最终状态
                 self.update_tooltip(ready, false);
-                // 启动失败时保留打开待办，等下次就绪再消费（FIXLIST P0-4）
-                let pending = if ready {
-                    self.pending_open.swap(false, Ordering::SeqCst)
-                } else {
-                    self.pending_open.load(Ordering::SeqCst)
-                };
-                if ready && pending {
-                    let _ = dsh::open_page();
+                if ready {
+                    // 成功：消费待办（无论来源）并打开页面
+                    self.pending_from_restart.store(false, Ordering::SeqCst);
+                    if self.pending_open.swap(false, Ordering::SeqCst) {
+                        let _ = dsh::open_page();
+                    }
+                } else if self.pending_from_restart.swap(false, Ordering::SeqCst) {
+                    // 重启失败：清除待办（避免 dsh 恢复后反复自动打开无意义页面），保留日志
+                    if self.pending_open.swap(false, Ordering::SeqCst) {
+                        log::warn("重启失败：已清除打开待办（dsh 未就绪，watchdog 将保活重试）");
+                    }
                 }
+                // "打开"来源的待办在失败时保留（P0-4：等下次就绪再消费），此处不处理
             }
-            UserEvent::TooltipUpdate { ready, starting } => {
-                self.update_tooltip(ready, starting);
+            UserEvent::TooltipUpdate { ready } => {
+                // 实时读 starting：事件到达时若 flow 已结束则显示最终状态，
+                // 避免竞态（watchdog 事件与 AnimationDone 乱序）导致 tooltip 卡"启动中"
+                self.update_tooltip(ready, self.starting.load(Ordering::SeqCst));
             }
         }
     }
@@ -465,6 +476,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         anim_running: Arc::new(AtomicBool::new(false)),
         starting: Arc::new(AtomicBool::new(false)),
         pending_open: Arc::new(AtomicBool::new(false)),
+        pending_from_restart: Arc::new(AtomicBool::new(false)),
         quitting: Arc::new(AtomicBool::new(false)),
         mutex_handle,
         proxy,
@@ -482,9 +494,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     event_loop.run_app(&mut app)?;
 
-    // 事件循环已退出（handle_quit 触发）：此时无 UI 阻塞，
-    // 同步清理 dsh（Job 秒杀 + 外部残留兜底；KILL_ON_JOB_CLOSE 兜底崩溃场景）
-    dsh::stop_harness();
+    // 仅主动退出（handle_quit 已置 quitting）时同步清理 dsh：
+    // Job 秒杀 + 外部残留兜底；KILL_ON_JOB_CLOSE 兜底崩溃与异常退出场景
+    if app.quitting.load(Ordering::SeqCst) {
+        dsh::stop_harness();
+    }
 
     Ok(())
 }
