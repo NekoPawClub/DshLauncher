@@ -1,5 +1,9 @@
 # DshLauncher
 
+<p align="left">
+  <img src="Icons/DeepSeekHarness-WhaleGirl.png" width="128" alt="DshLauncher 图标 —— DeepSeekHarness-WhaleGirl">
+</p>
+
 DeepSeek Harness（dsh）的 Windows 系统托盘启动器，使用 Rust 编写。
 
 ## 功能
@@ -7,7 +11,7 @@ DeepSeek Harness（dsh）的 Windows 系统托盘启动器，使用 Rust 编写�
 - 常驻系统托盘，无主窗口；单实例运行（重复启动自动退出）
 - **守护保活（watchdog）**：常驻守护线程周期探测 dsh 端口，dsh 未运行或意外退出时自动拉起（已实测：dsh 进程崩溃后数秒内自动恢复）
 - 启动时若 dsh 已在运行则直接复用（不终结、不重启）
-- **启动状态指示**：程序启动即让滚动条流动（白色滚动条 + 呼吸高亮），watchdog 探测到 dsh 就绪后自动停止；重启点击瞬间立即起动画
+- **启动状态指示**：程序启动即让扫描灯流动（扫描仪灯管效果：不透明全白灯管 + 两侧减淡灯光来回扫动，灯光溢出边缘自然裁剪），watchdog 探测到 dsh 就绪后自动停止；重启点击瞬间立即起动画
 - 托盘右键菜单（自上而下）：
   - **打开**：用系统默认方式（ShellExecute，无黑框）打开 dsh 操作页面（http://127.0.0.1:3080）；若 dsh 未运行则等待守护进程拉起，就绪后自动打开
   - **配置**：资源管理器打开 dsh 配置文件目录（%USERPROFILE%\.dsh）；若该目录已在资源管理器中打开则激活既有窗口（参考 VS Code 行为），不会重复新建

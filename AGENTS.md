@@ -40,14 +40,15 @@ DeepSeek Harness（dsh）的 Windows 系统托盘守护启动器，Rust 编写�
 ### 菜单行为
 - 打开：端口通 → `open_page()`；不通 → `pending_open=true` + 立即 `set_anim(true)`，watchdog 拉起后就绪自动打开
 - 配置：`open_config_dir()`（见下）
-- 重启：点击瞬间 `set_anim(true)`（滚动条立即流动）+ `pending_open=true` + 异步 `stop_harness()`，watchdog 拉起，flow 就绪后停动画并打开页面
+- 重启：点击瞬间 `set_anim(true)`（扫描灯立即流动）+ `pending_open=true` + 异步 `stop_harness()`，watchdog 拉起，flow 就绪后停动画并打开页面
 - 退出：`quitting=true` → 多轮（最多 3 轮）`stop_harness` + 端口检查 → `event_loop.exit()`
 - 左键单击无功能（`with_menu_on_left_click(false)`）；左键双击等同"打开"
 
-### 托盘动画（16 帧，150ms/帧）
-- 三合一：呼吸缩放（0.8~1.0）+ 高亮脉动（1.0~1.5，只增不减）+ 底部白色滚动条（高 1/8=4px，三角波游走，非进度填充）
+### 托盘动画（16 帧，150ms/帧，扫描仪灯管定稿）
+- 图标大小不变；中央 2px 不透明全白灯管 + 单侧 6px 线性衰减半透明灯光（灯管旁 alpha 180 → 远端 0）
+- 灯管中心在图标全宽（1~31）三角波来回扫动，灯光溢出画布边缘自然裁剪；逐列 overlay 叠加（透明区域也能被照亮）
 - 图标裁剪：以 PNG（984x984）中心裁剪 760x760 的比例（≈0.7724）等比应用到 ICO 源（256 → 中心 198）
-- 生成：`load_tray_icons()` 构建时一次性生成（裁剪 + 缩放居中 overlay + 亮度 + put_pixel 画条）
+- 生成：`load_tray_icons()` 构建时一次性生成（裁剪 + 逐帧绘制灯管/灯光列）
 - 默认图标与动画帧都从内嵌 ICO 解码（`include_bytes!`，32x32 RGBA）
 
 ## 关键实现细节（踩过的坑）
@@ -122,10 +123,11 @@ DeepSeek Harness（dsh）的 Windows 系统托盘守护启动器，Rust 编写�
 
 - 动画由独立动画线程驱动：`anim_running` 为 true 时每 150ms 发 `AnimationTick` 换帧
 - `set_anim(running)` 自由函数供任意线程调用：停止时发 `AnimationStop` 事件恢复默认图标
-- **程序启动即让滚动条流动**；watchdog 首轮探测（`was_ready=None` 强制触发）就绪后停止
+- **程序启动即让扫描灯流动**；watchdog 首轮探测（`was_ready=None` 强制触发）就绪后停止
 - watchdog 记录 `was_ready` 状态，dsh 就绪/失联状态变化时启停动画
 - 重启菜单：点击瞬间 `set_anim(true)` + 异步 stop，watchdog 拉起，flow 就绪后停动画并打开页面
-- 滚动条样式：白色（255,255,255），高 = 图标 1/8（32/8=4px），三角波来回游走（非进度填充）
+- **扫描仪灯管动画（定稿）**：图标大小不变；中央 2px 不透明全白灯管 + 单侧 6px 线性衰减半透明灯光（灯管旁 alpha 180 → 远端 0），灯管中心在图标全宽（1~31）三角波来回扫动，灯光溢出画布边缘自然裁剪；逐列 overlay 叠加（透明区域也能被照亮）
+- 曾尝试并被否掉的方案：呼吸缩放（1.0~1.5 放大呼吸）、底部滚动条（白色 1/8~1/4 高度）、亮度高亮——需要时按 git 历史恢复
 
 ## 调试经验（踩坑实录）
 
