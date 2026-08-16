@@ -179,7 +179,8 @@ pub fn open_page() -> io::Result<()> {
 /// 未找到时才新建窗口。
 pub fn open_config_dir() -> io::Result<()> {
     let dir = Path::new(&home_dir()).join(".dsh");
-    let dir_str = ps_quote_escape(&dir.to_string_lossy());
+    // 路径统一正斜杠（Windows 兼容）：Uri 构造与 PowerShell 字符串均无转义歧义
+    let dir_str = ps_quote_escape(&dir.to_string_lossy().replace('\\', "/"));
     let script = format!(
         r#"
 $ErrorActionPreference = 'SilentlyContinue'
@@ -291,7 +292,8 @@ pub fn start_harness(quitting: &AtomicBool) -> io::Result<()> {
     } else {
         format!("npx -y @deepseek-ai/dsh web --port {port}")
     };
-    let home_esc = ps_quote_escape(&home);
+    // 工作目录统一正斜杠（Windows 兼容，cmd/CreateProcess 均接受）
+    let home_esc = ps_quote_escape(&home.replace('\\', "/"));
     let script = format!(
         "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c','{web_cmd}' -WorkingDirectory '{home_esc}' -WindowStyle Hidden"
     );

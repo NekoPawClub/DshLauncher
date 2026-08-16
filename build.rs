@@ -20,6 +20,9 @@ fn main() {
         .join("Icons")
         .join("DeepSeekHarness-WhaleGirl.ico");
     assert!(ico_path.is_file(), "图标文件不存在：{}", ico_path.display());
+    // .rc 字符串字面量中反斜杠是转义符（如 \a、\n），会损坏路径
+    // （CI 路径 D:\a\DshLauncher\... 曾触发 RC2135）；统一转正斜杠
+    let ico_rc = ico_path.to_string_lossy().replace('\\', "/");
 
     // 版本号取自 Cargo.toml（如 1.0.0 → FILEVERSION 1,0,0,0）
     let pkg_version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "1.0.0".to_string());
@@ -65,7 +68,7 @@ BEGIN
     END
 END
 "#,
-        ico = ico_path.display(),
+        ico = ico_rc,
         v1 = v1,
         v2 = v2,
         v3 = v3,
@@ -78,10 +81,12 @@ END
         "未找到 rc.exe：请安装 Windows SDK（或 Visual Studio C++ 组件），         或通过环境变量 RC_EXE 指定 rc.exe 的完整路径",
     );
 
-    // 编译资源：rc /fo app.res app.rc
+    // 编译资源：rc /fo app.res app.rc（参数路径统一正斜杠，Windows 兼容）
     let res_file = Path::new(&out_dir).join("app.res");
+    let rc_arg = rc_file.to_str().unwrap().replace('\\', "/");
+    let res_arg = res_file.to_str().unwrap().replace('\\', "/");
     let status = Command::new(&rc_exe)
-        .args(["/fo", res_file.to_str().unwrap(), rc_file.to_str().unwrap()])
+        .args(["/fo", &res_arg, &rc_arg])
         .status()
         .expect("rc.exe 启动失败");
     assert!(status.success(), "rc.exe 编译资源失败（退出码 {status}）");
