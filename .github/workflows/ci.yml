@@ -9,7 +9,7 @@ on:
       - 'Cargo.lock'
       - 'build.rs'
       - 'src/**'
-      - 'Icons/**'
+      - 'icons/**'
       - '.github/workflows/ci.yml'
   pull_request:
     branches: [main]
@@ -18,7 +18,7 @@ on:
       - 'Cargo.lock'
       - 'build.rs'
       - 'src/**'
-      - 'Icons/**'
+      - 'icons/**'
       - '.github/workflows/ci.yml'
 
 jobs:

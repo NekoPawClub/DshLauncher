@@ -1,7 +1,7 @@
 //! 构建脚本：为 Windows 可执行文件嵌入应用图标（编译 .rc 资源并链接）
 //!
 //! 不依赖第三方资源编译 crate：自行定位 rc.exe（环境变量 RC_EXE → PATH →
-//! Windows Kits → VS 安装目录），把 Icons 目录下的 ICO 编译进 PE 资源。
+//! Windows Kits → VS 安装目录），把 icons 目录下的 ICO 编译进 PE 资源。
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,7 +17,7 @@ fn main() {
 
     // 应用图标（绝对路径，避免 rc.exe 相对路径解析差异）
     let ico_path = Path::new(&manifest_dir)
-        .join("Icons")
+        .join("icons")
         .join("DeepSeekHarness-WhaleGirl.ico");
     assert!(ico_path.is_file(), "图标文件不存在：{}", ico_path.display());
     // .rc 字符串字面量中反斜杠是转义符（如 \a、\n），会损坏路径
@@ -93,7 +93,7 @@ END
 
     // 将生成的 .res 交给链接器
     println!("cargo:rustc-link-arg={}", res_file.display());
-    println!("cargo:rerun-if-changed=Icons/DeepSeekHarness-WhaleGirl.ico");
+    println!("cargo:rerun-if-changed=icons/DeepSeekHarness-WhaleGirl.ico");
     println!("cargo:rerun-if-env-changed=RC_EXE");
 }
 

@@ -12,8 +12,8 @@ DeepSeek Harness（dsh）的 Windows 系统托盘守护启动器，Rust 编写�
   - `src/main.rs`：托盘、菜单、watchdog、启动流程、动画
   - `src/dsh.rs`：dsh 进程控制（启动/停止/端口探测）、ShellExecuteW、COM 脚本、单实例
   - `src/log.rs`：按天轮转文件日志（凌晨 4 点日界，保留 3 天）
-  - `build.rs`：把 Icons 下的 ICO 嵌入 PE 资源（桌面 exe 图标）
-  - `Icons/`：DeepSeekHarness-WhaleGirl.ico（256x256，唯一图标源）
+  - `build.rs`：把 icons 下的 ICO 嵌入 PE 资源（桌面 exe 图标）
+  - `icons/`：DeepSeekHarness-WhaleGirl.ico（256x256，唯一图标源）
   - `Cargo.toml`：bin 名 `DshLauncher`，release 带 lto+strip
 
 ## 架构（守护模型）

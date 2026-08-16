@@ -66,7 +66,7 @@ impl Drop for StartingGuard {
 }
 
 /// 托盘图标组：默认图标 + 启动动画帧（扫描仪灯管）
-struct TrayIcons {
+struct Trayicons {
     default: Icon,
     frames: Vec<Icon>,
 }
@@ -360,10 +360,10 @@ impl ApplicationHandler<UserEvent> for App {
 
 /// 加载托盘图标：默认图标（ICO 按 PNG 裁剪比例取中心 → 缩放 32x32）
 /// + 启动动画帧（扫描仪灯管来回扫动）
-fn load_tray_icons() -> Result<TrayIcons, Box<dyn Error>> {
+fn load_tray_icons() -> Result<Trayicons, Box<dyn Error>> {
     use image::Rgba;
 
-    let ico_bytes: &[u8] = include_bytes!("../Icons/DeepSeekHarness-WhaleGirl.ico");
+    let ico_bytes: &[u8] = include_bytes!("../icons/DeepSeekHarness-WhaleGirl.ico");
     let image = image::load_from_memory_with_format(ico_bytes, image::ImageFormat::Ico)?.to_rgba8();
 
     // 裁剪规则：以 PNG（984x984）中心裁剪 760x760 的比例为基准，
@@ -420,7 +420,7 @@ fn load_tray_icons() -> Result<TrayIcons, Box<dyn Error>> {
         frames.push(Icon::from_rgba(frame.into_raw(), 32, 32)?);
     }
 
-    Ok(TrayIcons { default, frames })
+    Ok(Trayicons { default, frames })
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
