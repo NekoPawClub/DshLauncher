@@ -1,8 +1,6 @@
 # DshLauncher
 
-<p align="left">
-  <img src="Icons/DeepSeekHarness-WhaleGirl.png" width="128" alt="DshLauncher 图标 —— DeepSeekHarness-WhaleGirl">
-</p>
+![鲸鱼娘图标](icons/DeepSeekHarness-WhaleGirl.png)
 
 DeepSeek Harness（dsh）的 Windows 系统托盘启动器，使用 Rust 编写。
 
