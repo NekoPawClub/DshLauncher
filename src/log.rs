@@ -1,12 +1,12 @@
-//! 极简文件日志：按"日志日"（凌晨 4 点为日界）分文件，追加写入
-//! ~/.dsh/launcher-YYYY-MM-DD.log，仅保留最近 3 天，过期文件自动清理。
+//! 极简文件日志：单文件追加写入 ~/.dsh/launcher.log（测试实例 launcher-<instance>.log），
+//! 仅保留最近 3 天，过时日志按每行开头的时间标签清理。
 //!
 //! 守护程序无控制台窗口，故障诊断依赖此日志。
 //! 记录点：watchdog 端口状态与拉起、启动流程起止、Job 操作成败、stop 脚本执行。
 
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::SYSTEMTIME;
@@ -14,6 +14,9 @@ use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 
 /// 日志保留天数（含今天）
 const KEEP_DAYS: i64 = 3;
+
+/// 写入与清理互斥：避免清理重写文件时与追加写入互相踩踏
+static LOG_LOCK: Mutex<()> = Mutex::new(());
 
 /// 上次清理时所在的日志日：避免每次写入都扫描目录，一天只清理一次
 static LAST_CLEANUP: Mutex<Option<(i64, u32, u32)>> = Mutex::new(None);
@@ -31,24 +34,25 @@ fn log_base_dir() -> PathBuf {
     }
 }
 
-/// 实例后缀（DSHLAUNCHER_INSTANCE，测试实例隔离日志文件）
+/// 实例后缀（DSHLAUNCHER_INSTANCE，测试实例隔离日志文件），含尾部连字符
 fn instance_suffix() -> String {
     match std::env::var("DSHLAUNCHER_INSTANCE") {
-        Ok(s) if !s.is_empty() => format!("{s}-"),
+        Ok(s) if !s.trim().is_empty() => format!("{}-", s.trim()),
         _ => String::new(),
     }
 }
 
-/// 当前日志文件路径：{base}/launcher[-{instance}-]{YYYY-MM-DD}.log
+/// 日志文件名：正常为 launcher.log；测试实例为 launcher-<instance>.log
+fn log_file_name() -> String {
+    match std::env::var("DSHLAUNCHER_INSTANCE") {
+        Ok(s) if !s.trim().is_empty() => format!("launcher-{s}.log"),
+        _ => "launcher.log".to_string(),
+    }
+}
+
+/// 当前日志文件路径：{base}/launcher.log（测试实例为 launcher-<instance>.log）
 fn log_path() -> PathBuf {
-    let (y, m, d) = current_log_day();
-    log_base_dir().join(format!(
-        "launcher-{}{:04}-{:02}-{:02}.log",
-        instance_suffix(),
-        y,
-        m,
-        d
-    ))
+    log_base_dir().join(log_file_name())
 }
 
 /// 本地时间戳 YYYY-MM-DD HH:MM:SS
@@ -105,19 +109,68 @@ fn log_day_of(st: &SYSTEMTIME) -> (i64, u32, u32) {
     civil_from_days(adjusted)
 }
 
-/// 删除超过保留天数的日志文件（按文件名中的日期，仅匹配本实例前缀）
-fn cleanup_old_logs() {
-    let today = current_log_day();
-    let mut last = LAST_CLEANUP.lock().unwrap_or_else(|p| p.into_inner());
-    if *last == Some(today) {
-        return;
+/// 从日志行开头解析本地时间标签 YYYY-MM-DD HH:MM:SS。
+/// 无法解析时返回 None（调用方会保守保留该行，避免误删）。
+fn parse_timestamp(line: &str) -> Option<SYSTEMTIME> {
+    let b = line.as_bytes();
+    if b.len() < 19
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b' '
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
     }
-    *last = Some(today);
 
-    let today_days = days_from_civil(today.0, today.1, today.2);
-    let cutoff = today_days - (KEEP_DAYS - 1); // 今天及之前 2 天保留
+    Some(SYSTEMTIME {
+        wYear: line.get(0..4)?.parse().ok()?,
+        wMonth: line.get(5..7)?.parse().ok()?,
+        wDay: line.get(8..10)?.parse().ok()?,
+        wHour: line.get(11..13)?.parse().ok()?,
+        wMinute: line.get(14..16)?.parse().ok()?,
+        wSecond: line.get(17..19)?.parse().ok()?,
+        wMilliseconds: 0,
+        wDayOfWeek: 0,
+    })
+}
+
+/// 判断一行日志是否应保留：无时间标签的行保留；有时间标签的按日志日（凌晨 4 点日界）
+/// 判断是否早于 cutoff（自 1970-01-01 的天数）。
+fn should_keep_log_line(line: &str, cutoff: i64) -> bool {
+    match parse_timestamp(line) {
+        Some(st) => {
+            let (y, m, d) = log_day_of(&st);
+            days_from_civil(y, m, d) >= cutoff
+        }
+        None => true,
+    }
+}
+
+/// 按行首时间标签清理单文件日志：只保留 cutoff 及之后的日志行。
+/// 读取和重写都假定调用方已持有 LOG_LOCK。
+fn prune_log_file(path: &Path, cutoff: i64) {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let mut kept = String::with_capacity(content.len());
+    for line in content.split_inclusive('\n') {
+        if should_keep_log_line(line, cutoff) {
+            kept.push_str(line);
+        }
+    }
+    if kept.len() != content.len() {
+        if let Err(e) = std::fs::write(path, kept.as_bytes()) {
+            eprintln!("[log] 清理日志失败 {}: {e}", path.display());
+        }
+    }
+}
+
+/// 删除旧版按天拆分遗留的日志文件（launcher-YYYY-MM-DD.log 或 launcher-test-YYYY-MM-DD.log），
+/// 仍按文件名中的日期判断是否过期。
+fn remove_legacy_daily_logs(base: &Path, cutoff: i64) {
     let prefix = format!("launcher-{}", instance_suffix());
-    let Ok(entries) = std::fs::read_dir(log_base_dir()) else {
+    let Ok(entries) = std::fs::read_dir(base) else {
         return;
     };
     for entry in entries.filter_map(|e| e.ok()) {
@@ -148,7 +201,28 @@ fn cleanup_old_logs() {
     }
 }
 
+/// 清理日志：删除旧版过期的按天日志文件，并按行时间标签清理 launcher.log 中的过时日志。
+/// 调用方必须已持有 LOG_LOCK。
+fn cleanup_old_logs() {
+    let today = current_log_day();
+    let mut last = LAST_CLEANUP.lock().unwrap_or_else(|p| p.into_inner());
+    if *last == Some(today) {
+        return;
+    }
+    *last = Some(today);
+
+    let today_days = days_from_civil(today.0, today.1, today.2);
+    let cutoff = today_days - (KEEP_DAYS - 1); // 今天及之前 2 天保留
+
+    let base = log_base_dir();
+    remove_legacy_daily_logs(base.as_path(), cutoff);
+
+    let path = log_path();
+    prune_log_file(path.as_path(), cutoff);
+}
+
 fn write(level: &str, msg: &str) {
+    let _guard = LOG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     cleanup_old_logs();
     let path = log_path();
     if let Some(parent) = path.parent() {
@@ -242,14 +316,14 @@ mod tests {
         let tmp = std::env::temp_dir().join("dsh-launcher-log-test");
         let _ = std::fs::create_dir_all(&tmp);
         std::env::set_var("DSHLAUNCHER_LOG_DIR", &tmp);
+        std::env::set_var("DSHLAUNCHER_INSTANCE", "");
         info("单元测试日志写入验证");
         let path = log_path();
         assert!(path.is_file(), "日志文件应已创建：{}", path.display());
-        assert!(
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("launcher-") && n.ends_with(".log")),
-            "文件名应带日期：{}",
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("launcher.log"),
+            "应写入单个日志文件 launcher.log，实际：{}",
             path.display()
         );
         let content = std::fs::read_to_string(&path).unwrap_or_default();
@@ -257,7 +331,45 @@ mod tests {
             content.contains("单元测试日志写入验证"),
             "日志内容应包含写入信息，实际：{content}"
         );
+        std::env::remove_var("DSHLAUNCHER_INSTANCE");
         std::env::remove_var("DSHLAUNCHER_LOG_DIR");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 按行首时间标签清理过时日志
+    #[test]
+    fn prune_log_file_removes_outdated_lines() {
+        let tmp = std::env::temp_dir().join("dsh-launcher-prune-test");
+        let _ = std::fs::create_dir_all(&tmp);
+        let path = tmp.join("launcher-prune-test.log");
+        // 保留 2026-08-14 及之后（含 08-15 凌晨 3 点，按 4 点日界仍归 08-14）
+        let cutoff = days_from_civil(2026, 8, 14);
+        let content = concat!(
+            "2026-08-13 23:59:59 [INFO] old\n",
+            "2026-08-14 04:00:00 [INFO] keep-day-14\n",
+            "no-timestamp [INFO] keep\n",
+            "2026-08-15 03:59:59 [INFO] keep-day-15\n"
+        );
+        std::fs::write(&path, content.as_bytes()).unwrap();
+
+        prune_log_file(path.as_path(), cutoff);
+
+        let pruned = std::fs::read_to_string(&path).unwrap();
+        assert!(!pruned.contains("old"), "过时行应被删除，实际：{pruned}");
+        assert!(pruned.contains("keep-day-14"), "边界行应保留，实际：{pruned}");
+        assert!(pruned.contains("no-timestamp"), "无时间标签行应保留，实际：{pruned}");
+        assert!(pruned.contains("keep-day-15"), "按 4 点日界应保留，实际：{pruned}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 时间标签解析
+    #[test]
+    fn parse_timestamp_parses_log_prefix() {
+        let st = parse_timestamp("2026-08-15 03:59:59 [INFO] x").unwrap();
+        assert_eq!(
+            (st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond),
+            (2026, 8, 15, 3, 59, 59)
+        );
+        assert!(parse_timestamp("no timestamp").is_none());
     }
 }

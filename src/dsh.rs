@@ -152,17 +152,16 @@ fn job_handle() -> Option<HANDLE> {
     }
 }
 
-/// 用系统默认方式（ShellExecuteW）打开 dsh 操作页面，不产生任何控制台窗口
-pub fn open_page() -> io::Result<()> {
-    let url = web_url();
-    let url_wide = to_wide(&url);
+/// 用系统默认方式（ShellExecuteW）打开目标（URL / 文件 / 目录），不产生任何控制台窗口
+fn shell_execute_open(target: &str) -> io::Result<()> {
+    let target_wide = to_wide(target);
     unsafe {
         let result = ShellExecuteW(
             std::ptr::null_mut(), // 无父窗口
             to_wide("open").as_ptr(),
-            url_wide.as_ptr(), // 目标：URL
-            std::ptr::null(),  // 无参数
-            std::ptr::null(),  // 无工作目录
+            target_wide.as_ptr(), // 目标：URL / 文件 / 目录
+            std::ptr::null(),     // 无参数
+            std::ptr::null(),     // 无工作目录
             SW_SHOWNORMAL,
         );
         // 返回值大于 32 表示成功
@@ -174,50 +173,20 @@ pub fn open_page() -> io::Result<()> {
     }
 }
 
-/// 用资源管理器打开 dsh 配置目录（~/.dsh）：
-/// 若该目录已在某个资源管理器窗口中打开，则激活既有窗口而非新建（参考 VS Code 行为）；
-/// 未找到时才新建窗口。
+/// 用系统默认方式（ShellExecuteW）打开 dsh 操作页面，不产生任何控制台窗口
+pub fn open_page() -> io::Result<()> {
+    shell_execute_open(&web_url())
+}
+
+/// 用资源管理器打开 dsh 配置目录（~/.dsh）。
+/// 先确保目录存在，再通过 ShellExecuteW 直接让系统资源管理器打开；
+/// 不再依赖隐藏 PowerShell 进程里的 Shell.Application COM 枚举（该方案在部分环境不弹窗）。
 pub fn open_config_dir() -> io::Result<()> {
     let dir = Path::new(&home_dir()).join(".dsh");
-    // 路径统一正斜杠（Windows 兼容）：Uri 构造与 PowerShell 字符串均无转义歧义
-    let dir_str = ps_quote_escape(&dir.to_string_lossy().replace('\\', "/"));
-    let script = format!(
-        r#"
-$ErrorActionPreference = 'SilentlyContinue'
-$target = '{dir}'
-# Uri 编码后与资源管理器 LocationURL 格式一致（空格/特殊字符百分号编码）
-$uri = New-Object System.Uri($target)
-$prefix = $uri.AbsoluteUri
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public class Win32Activate {{
-    [DllImport("user32.dll")]
-    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-    [DllImport("user32.dll")]
-    public static extern bool SetForegroundWindow(IntPtr hWnd);
-}}
-"@
-$shell = New-Object -ComObject Shell.Application
-$found = $false
-foreach ($w in $shell.Windows()) {{
-    $loc = $w.LocationURL
-    if ($loc -and $prefix -and $loc.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {{
-        try {{
-            # 激活既有窗口到前台（VS Code 行为）：恢复最小化 + 置前
-            $hwnd = [IntPtr]$w.HWND
-            [Win32Activate]::ShowWindow($hwnd, 9) | Out-Null
-            [Win32Activate]::SetForegroundWindow($hwnd) | Out-Null
-        }} catch {{}}
-        $found = $true
-        break
-    }}
-}}
-if (-not $found) {{ $null = $shell.Open($target) }}
-"#,
-        dir = dir_str
-    );
-    run_ps_hidden(&script).map(|_| ())
+    // 目录不存在时先创建，避免 ShellExecuteW 打开不存在的路径而失败
+    std::fs::create_dir_all(&dir)?;
+    let dir_str = dir.to_string_lossy().into_owned();
+    shell_execute_open(&dir_str)
 }
 
 /// 构造停止 dsh 的 PowerShell 脚本（仅作为兜底：处理端口被外部进程占用、

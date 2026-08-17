@@ -11,10 +11,16 @@ DeepSeek Harness（dsh）的 Windows 系统托盘守护启动器，Rust 编写�
 - 目录结构：
   - `src/main.rs`：托盘、菜单、watchdog、启动流程、动画
   - `src/dsh.rs`：dsh 进程控制（启动/停止/端口探测）、ShellExecuteW、COM 脚本、单实例
-  - `src/log.rs`：按天轮转文件日志（凌晨 4 点日界，保留 3 天）
+  - `src/log.rs`：单文件日志 `launcher.log`（按行时间标签 + 凌晨 4 点日界，保留 3 天）
   - `build.rs`：把 icons 下的 ICO 嵌入 PE 资源（桌面 exe 图标）
   - `icons/`：DeepSeekHarness-WhaleGirl.ico（256x256，唯一图标源）
   - `Cargo.toml`：bin 名 `DshLauncher`，release 带 lto+strip
+
+## 路径书写规范（全项目强制）
+
+- Windows 路径在项目注释、README/AGENTS 等文档描述中一律使用正斜杠 `/`，不写反斜杠 `\`。
+- 示例：`%USERPROFILE%/.dsh`、`%USERPROFILE%/.dsh/launcher.log`、`C:/Program Files/...`、`D:/Scoop/persist/rustup/.cargo`。
+- 代码字符串、PowerShell/正则转义等运行所需的字面反斜杠除外；这些反斜杠按语法要求保留，不按“文档路径”处理。
 
 ## 架构（守护模型）
 
@@ -76,13 +82,13 @@ DeepSeek Harness（dsh）的 Windows 系统托盘守护启动器，Rust 编写�
 - 杀 dsh：netstat 按端口找监听 PID → `taskkill /PID x /T /F`（杀进程树）
 - 端口 `DSHLAUNCHER_PORT` 环境变量可覆盖默认 3080
 
-### 打开资源管理器复用窗口（VS Code 方案）
-- PowerShell `Shell.Application` COM：遍历 `$shell.Windows()` 比较 `LocationURL` 前缀
-- 命中 → `$w.Visible = $true` 激活既有窗口；未命中 → `$shell.Open($path)` 新建
+### 打开资源管理器配置目录
+- 直接用 `ShellExecuteW` 打开 `%USERPROFILE%/.dsh`（打开前 `create_dir_all` 确保存在）
+- 曾用 PowerShell `Shell.Application` COM 遍历 `$shell.Windows()` 复用窗口，但隐藏 PowerShell 进程里 COM 枚举不稳定，导致点击「配置」不弹文件夹，已改为 ShellExecuteW
 
 ### build.rs（图标嵌入）
 - 动态生成 .rc（含 ICO 绝对路径）→ 定位 rc.exe（`RC_EXE` 环境变量 → PATH → Windows Kits → VS 递归）→ `rc /fo app.res` → `cargo:rustc-link-arg` 传 .res
-- 本机 rc.exe：`C:\Program Files (x86)\Windows Kits\10\bin\<ver>\x64\rc.exe`
+- 本机 rc.exe：`C:/Program Files (x86)/Windows Kits/10/bin/<ver>/x64/rc.exe`
 
 ## 构建
 
@@ -94,7 +100,7 @@ DeepSeek Harness（dsh）的 Windows 系统托盘守护启动器，Rust 编写�
 
 ### 沙箱环境（开发代理会话）
 - 沙箱 schannel TLS 被网关阻断（node/OpenSSL 可通，cargo/curl/PowerShell 不可通）——与文件沙箱权限无关
-- 沙箱不可写 `D:\Scoop\persist\rustup\.cargo` → 构建前设 `$env:CARGO_HOME = "$env:TEMP\dsh-cargo-home"`
+- 沙箱不可写 `D:/Scoop/persist/rustup/.cargo` → 构建前设 `$env:CARGO_HOME = "$env:TEMP/dsh-cargo-home"`
 - 需临时重建镜像代理（验证后删除，勿提交）：
   1. 写 `.cargo/config.toml`：`replace-with = "local-mirror"`，`registry = "sparse+http://127.0.0.1:8081/"`
   2. 写 `scripts/sparse-mirror.mjs`（node 代理，转发 index.crates.io / static.crates.io）

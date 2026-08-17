@@ -12,7 +12,7 @@ DeepSeek Harness（dsh）的 Windows 系统托盘启动器，使用 Rust 编写�
 - **启动状态指示**：程序启动即让扫描灯流动（扫描仪灯管效果：不透明全白灯管 + 两侧减淡灯光来回扫动，灯光溢出边缘自然裁剪），watchdog 探测到 dsh 就绪后自动停止；重启点击瞬间立即起动画
 - 托盘右键菜单（自上而下）：
   - **打开**：用系统默认方式（ShellExecute，无黑框）打开 dsh 操作页面（http://127.0.0.1:3080）；若 dsh 未运行则等待守护进程拉起，就绪后自动打开
-  - **配置**：资源管理器打开 dsh 配置文件目录（%USERPROFILE%\.dsh）；若该目录已在资源管理器中打开则激活既有窗口（参考 VS Code 行为），不会重复新建
+  - **配置**：资源管理器打开 dsh 配置文件目录（%USERPROFILE%/.dsh）；目录不存在时自动创建
   - **重启**：仅终结 dsh，由守护线程自动保活拉起（npx -y @deepseek-ai/dsh web），就绪后自动打开操作页面
   - **退出**：结束 Harness 并退出本程序
 - 左键单击无功能；左键双击等同“打开”
@@ -39,4 +39,4 @@ DeepSeek Harness（dsh）的 Windows 系统托盘启动器，使用 Rust 编写�
 - 托盘图标与可执行文件图标均来自 `icons/DeepSeekHarness-WhaleGirl.ico`
 - 图标来源：[deepseek-whale-girl-icon](https://github.com/fornarwhal/deepseek-whale-girl-icon.git)
 - 单实例：重复启动会自动退出
-- 运行日志：写入 `%USERPROFILE%\.dsh\launcher-YYYY-MM-DD.log`（按天轮转，凌晨 4 点分割，仅保留最近 3 天；测试实例自动带后缀）；可用环境变量 `DSHLAUNCHER_LOG_DIR` 覆盖日志目录
+- 运行日志：写入 `%USERPROFILE%/.dsh/launcher.log`（单文件，按每行时间标签保留最近 3 天，凌晨 4 点日界；测试实例自动带后缀）；可用环境变量 `DSHLAUNCHER_LOG_DIR` 覆盖日志目录

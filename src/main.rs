@@ -293,8 +293,11 @@ impl ApplicationHandler<UserEvent> for App {
                     // 打开：检查 dsh 运行状态，未运行先启动
                     self.handle_open();
                 } else if ev.id() == &self.config_id {
-                    // 配置：资源管理器打开 dsh 配置目录 ~/.dsh（复用既有窗口）
-                    let _ = dsh::open_config_dir();
+                    // 配置：资源管理器打开 dsh 配置目录 ~/.dsh
+                    log::info("用户请求打开配置目录");
+                    if let Err(e) = dsh::open_config_dir() {
+                        log::error(&format!("打开配置目录失败：{e}"));
+                    }
                 } else if ev.id() == &self.restart_id {
                     // 重启：立即让扫描灯流动（动画由主线程事件循环驱动，
                     // 终结 dsh 必须在后台线程执行，避免阻塞主线程导致动画延迟）
