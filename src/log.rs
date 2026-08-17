@@ -356,9 +356,18 @@ mod tests {
 
         let pruned = std::fs::read_to_string(&path).unwrap();
         assert!(!pruned.contains("old"), "过时行应被删除，实际：{pruned}");
-        assert!(pruned.contains("keep-day-14"), "边界行应保留，实际：{pruned}");
-        assert!(pruned.contains("no-timestamp"), "无时间标签行应保留，实际：{pruned}");
-        assert!(pruned.contains("keep-day-15"), "按 4 点日界应保留，实际：{pruned}");
+        assert!(
+            pruned.contains("keep-day-14"),
+            "边界行应保留，实际：{pruned}"
+        );
+        assert!(
+            pruned.contains("no-timestamp"),
+            "无时间标签行应保留，实际：{pruned}"
+        );
+        assert!(
+            pruned.contains("keep-day-15"),
+            "按 4 点日界应保留，实际：{pruned}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
