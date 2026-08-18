@@ -1,8 +1,9 @@
-//! 极简文件日志：单文件追加写入 ~/.dsh/launcher.log（测试实例 launcher-<instance>.log），
+//! 极简文件日志：单文件追加写入 ~/.dsh/launcher.log (测试实例 launcher-<instance>.log)，
 //! 仅保留最近 3 天，过时日志按每行开头的时间标签清理。
 //!
 //! 守护程序无控制台窗口，故障诊断依赖此日志。
 //! 记录点：watchdog 端口状态与拉起、启动流程起止、Job 操作成败、stop 脚本执行。
+//! dsh 子进程 (npx/node) 的输出写入同目录 dsh.log (测试实例 dsh-<instance>.log)。
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -12,7 +13,7 @@ use std::sync::Mutex;
 use windows_sys::Win32::Foundation::SYSTEMTIME;
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 
-/// 日志保留天数（含今天）
+/// 日志保留天数 (含今天)
 const KEEP_DAYS: i64 = 3;
 
 /// 写入与清理互斥：避免清理重写文件时与追加写入互相踩踏
@@ -21,7 +22,7 @@ static LOG_LOCK: Mutex<()> = Mutex::new(());
 /// 上次清理时所在的日志日：避免每次写入都扫描目录，一天只清理一次
 static LAST_CLEANUP: Mutex<Option<(i64, u32, u32)>> = Mutex::new(None);
 
-/// 日志目录：DSHLAUNCHER_LOG_DIR 覆盖（沙箱/CI 调试钩子），否则 %USERPROFILE%\.dsh
+/// 日志目录：DSHLAUNCHER_LOG_DIR 覆盖 (沙箱/CI 调试钩子)，否则 %USERPROFILE%\.dsh
 fn log_base_dir() -> PathBuf {
     match std::env::var("DSHLAUNCHER_LOG_DIR") {
         Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
@@ -34,7 +35,7 @@ fn log_base_dir() -> PathBuf {
     }
 }
 
-/// 实例后缀（DSHLAUNCHER_INSTANCE，测试实例隔离日志文件），含尾部连字符
+/// 实例后缀 (DSHLAUNCHER_INSTANCE，测试实例隔离日志文件)，含尾部连字符
 fn instance_suffix() -> String {
     match std::env::var("DSHLAUNCHER_INSTANCE") {
         Ok(s) if !s.trim().is_empty() => format!("{}-", s.trim()),
@@ -50,9 +51,16 @@ fn log_file_name() -> String {
     }
 }
 
-/// 当前日志文件路径：{base}/launcher.log（测试实例为 launcher-<instance>.log）
+/// 当前日志文件路径：{base}/launcher.log (测试实例为 launcher-<instance>.log)
 fn log_path() -> PathBuf {
     log_base_dir().join(log_file_name())
+}
+
+/// dsh 子进程输出日志：{base}/dsh.log (测试实例为 dsh-<instance>.log)
+/// start_harness 把 dsh 启动命令的 stdout/stderr 追加写入此文件，
+/// 启动卡顿/失败时由此定位原因
+pub fn dsh_log_path() -> PathBuf {
+    log_base_dir().join(format!("dsh{}.log", instance_suffix()))
 }
 
 /// 本地时间戳 YYYY-MM-DD HH:MM:SS
@@ -67,7 +75,7 @@ fn timestamp() -> String {
     }
 }
 
-/// 民用日期 → 自 1970-01-01 起的天数（Howard Hinnant 算法，正确处理闰年）
+/// 民用日期 → 自 1970-01-01 起的天数 (Howard Hinnant 算法，正确处理闰年)
 fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let (m, d) = (m as i64, d as i64);
     let y = if m <= 2 { y - 1 } else { y };
@@ -79,7 +87,7 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146097 + doe - 719468
 }
 
-/// 天数 → 民用日期（Howard Hinnant 算法）
+/// 天数 → 民用日期 (Howard Hinnant 算法)
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
@@ -93,7 +101,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
 }
 
-/// 当前时刻归属的日志日（凌晨 4 点前归前一天）
+/// 当前时刻归属的日志日 (凌晨 4 点前归前一天)
 fn current_log_day() -> (i64, u32, u32) {
     unsafe {
         let mut st: SYSTEMTIME = std::mem::zeroed();
@@ -102,7 +110,7 @@ fn current_log_day() -> (i64, u32, u32) {
     }
 }
 
-/// 计算 SYSTEMTIME 归属的日志日（凌晨 4 点为日界）
+/// 计算 SYSTEMTIME 归属的日志日 (凌晨 4 点为日界)
 fn log_day_of(st: &SYSTEMTIME) -> (i64, u32, u32) {
     let days = days_from_civil(st.wYear as i64, st.wMonth as u32, st.wDay as u32);
     let adjusted = if st.wHour < 4 { days - 1 } else { days };
@@ -110,7 +118,7 @@ fn log_day_of(st: &SYSTEMTIME) -> (i64, u32, u32) {
 }
 
 /// 从日志行开头解析本地时间标签 YYYY-MM-DD HH:MM:SS。
-/// 无法解析时返回 None（调用方会保守保留该行，避免误删）。
+/// 无法解析时返回 None (调用方会保守保留该行，避免误删)。
 fn parse_timestamp(line: &str) -> Option<SYSTEMTIME> {
     let b = line.as_bytes();
     if b.len() < 19
@@ -135,8 +143,8 @@ fn parse_timestamp(line: &str) -> Option<SYSTEMTIME> {
     })
 }
 
-/// 判断一行日志是否应保留：无时间标签的行保留；有时间标签的按日志日（凌晨 4 点日界）
-/// 判断是否早于 cutoff（自 1970-01-01 的天数）。
+/// 判断一行日志是否应保留：无时间标签的行保留；有时间标签的按日志日 (凌晨 4 点日界)
+/// 判断是否早于 cutoff (自 1970-01-01 的天数)。
 fn should_keep_log_line(line: &str, cutoff: i64) -> bool {
     match parse_timestamp(line) {
         Some(st) => {
@@ -166,7 +174,7 @@ fn prune_log_file(path: &Path, cutoff: i64) {
     }
 }
 
-/// 删除旧版按天拆分遗留的日志文件（launcher-YYYY-MM-DD.log 或 launcher-test-YYYY-MM-DD.log），
+/// 删除旧版按天拆分遗留的日志文件 (launcher-YYYY-MM-DD.log 或 launcher-test-YYYY-MM-DD.log)，
 /// 仍按文件名中的日期判断是否过期。
 fn remove_legacy_daily_logs(base: &Path, cutoff: i64) {
     let prefix = format!("launcher-{}", instance_suffix());
@@ -177,7 +185,7 @@ fn remove_legacy_daily_logs(base: &Path, cutoff: i64) {
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        // prefix 已含尾部连字符（launcher- 或 launcher-test-），直接剥离后应为日期
+        // prefix 已含尾部连字符 (launcher- 或 launcher-test-)，直接剥离后应为日期
         let Some(rest) = name.strip_prefix(&prefix) else {
             continue;
         };
@@ -249,7 +257,7 @@ pub fn warn(msg: &str) {
     write("WARN", msg);
 }
 
-/// 记录一条 FAIL 日志（4 字符标签，与 INFO/WARN 对齐）
+/// 记录一条 FAIL 日志 (4 字符标签，与 INFO/WARN 对齐)
 pub fn error(msg: &str) {
     write("FAIL", msg);
 }
@@ -294,14 +302,14 @@ mod tests {
         st.wHour = 3;
         assert_eq!(log_day_of(&st), (2025, 12, 31), "跨年边界");
 
-        // 世纪闰年：2000 年 3 月 1 日 03:00 → 2 月 29 日（2000 是闰年）
+        // 世纪闰年：2000 年 3 月 1 日 03:00 → 2 月 29 日 (2000 是闰年)
         st.wYear = 2000;
         st.wMonth = 3;
         st.wDay = 1;
         st.wHour = 3;
         assert_eq!(log_day_of(&st), (2000, 2, 29), "世纪闰年 2000");
 
-        // 非世纪闰年：1900 年 3 月 1 日 03:00 → 2 月 28 日（1900 不是闰年）
+        // 非世纪闰年：1900 年 3 月 1 日 03:00 → 2 月 28 日 (1900 不是闰年)
         st.wYear = 1900;
         st.wMonth = 3;
         st.wDay = 1;
@@ -309,7 +317,7 @@ mod tests {
         assert_eq!(log_day_of(&st), (1900, 2, 28), "世纪非闰年 1900");
     }
 
-    /// 日志写入与文件创建（临时目录 + LOG_DIR 钩子，不依赖用户主目录权限）
+    /// 日志写入与文件创建 (临时目录 + LOG_DIR 钩子，不依赖用户主目录权限)
     #[test]
     fn log_write_creates_file() {
         // 注意：set_var 修改进程环境变量，仅本测试使用且无其他测试并发读取该变量
@@ -342,7 +350,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("dsh-launcher-prune-test");
         let _ = std::fs::create_dir_all(&tmp);
         let path = tmp.join("launcher-prune-test.log");
-        // 保留 2026-08-14 及之后（含 08-15 凌晨 3 点，按 4 点日界仍归 08-14）
+        // 保留 2026-08-14 及之后 (含 08-15 凌晨 3 点，按 4 点日界仍归 08-14)
         let cutoff = days_from_civil(2026, 8, 14);
         let content = concat!(
             "2026-08-13 23:59:59 [INFO] old\n",
