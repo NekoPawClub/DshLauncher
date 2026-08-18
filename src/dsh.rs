@@ -1,11 +1,10 @@
 //! dsh (DeepSeek Harness) 进程控制：启动、停止、页面打开、端口探测
 
-use std::fs::OpenOptions;
-use std::io;
+use std::io::{self, BufRead, BufReader, Read};
 use std::net::TcpStream;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
@@ -173,11 +172,6 @@ pub fn open_page() -> io::Result<()> {
     shell_execute_open(&web_url())
 }
 
-/// 用系统默认方式 (ShellExecuteW) 打开任意 URL (如更新发布页)，不产生任何控制台窗口
-pub fn open_url(target: &str) -> io::Result<()> {
-    shell_execute_open(target)
-}
-
 /// 用资源管理器打开 dsh 配置目录 (~/.dsh)。
 /// 先确保目录存在，再通过 ShellExecuteW 直接让系统资源管理器打开；
 /// 不再依赖隐藏 PowerShell 进程里的 Shell.Application COM 枚举 (该方案在部分环境不弹窗)。
@@ -249,13 +243,43 @@ pub fn stop_harness() {
     }
 }
 
-/// dsh 输出日志大小上限 (1 MiB)：超过即清空重来，避免文件无限增长
-const DSH_LOG_MAX_BYTES: u64 = 1 << 20;
+/// 把 dsh 子进程的 stdout/stderr 逐行读入 launcher.log。
+/// 子进程输出由日志模块统一加时间标签与 [DSH] 标记，因此也会参与 3 天清理，
+/// 不再需要单独的 dsh.log 与 1 MiB 清空逻辑。
+/// 读取按缓冲块切分：遇到换行即按行写入；没有换行也随缓冲块落盘，
+/// 避免 npm 进度条等无换行输出长时间滞留内存 (与原直连文件句柄的实时性一致)。
+fn pump_dsh_output<R: Read + Send + 'static>(reader: R) {
+    thread::spawn(move || {
+        let mut reader = BufReader::with_capacity(16 * 1024, reader);
+        loop {
+            let available = match reader.fill_buf() {
+                Ok(buf) => buf,
+                Err(e) => {
+                    crate::log::error(&format!("读取 dsh 输出失败：{e}"));
+                    break;
+                }
+            };
+            if available.is_empty() {
+                break;
+            }
+            let take = available
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(available.len(), |pos| pos + 1);
+            let mut line = String::from_utf8_lossy(&available[..take]).into_owned();
+            while line.ends_with('\n') || line.ends_with('\r') {
+                line.pop();
+            }
+            crate::log::dsh_output(&line);
+            reader.consume(take);
+        }
+    });
+}
 
 /// 后台隐藏窗口启动 dsh：npx @deepseek-ai/dsh web (工作目录为用户主目录)。
 /// 端口覆盖时透传 --port；-y 避免 npx 首次安装的交互确认。
-/// cmd/npx/node 的 stdout 与 stderr 统一追加写入 dsh 输出日志 (默认 ~/.dsh/dsh.log)：
-/// 启动卡顿/失败时由此定位原因 (此前输出全部丢失，无从排查)。
+/// cmd/npx/node 的 stdout 与 stderr 由读取线程逐行写入 launcher.log
+/// (时间标签 + [DSH] 标记)，与启动器日志合并，不再使用单独的 dsh.log。
 /// 启动后立即把进程树挂入全局 Job (KILL_ON_JOB_CLOSE)。
 /// quitting：退出请求标志，spawn 后立即检查，避免退出竞态导致进程树漏挂 Job。
 pub fn start_harness(quitting: &AtomicBool) -> io::Result<()> {
@@ -266,31 +290,34 @@ pub fn start_harness(quitting: &AtomicBool) -> io::Result<()> {
     } else {
         format!("npx -y @deepseek-ai/dsh web --port {port}")
     };
-    // dsh 输出日志：超过上限先清空 (追加写，见下)
-    let dsh_log = crate::log::dsh_log_path();
-    if let Ok(meta) = std::fs::metadata(&dsh_log) {
-        if meta.len() > DSH_LOG_MAX_BYTES {
-            let _ = std::fs::write(&dsh_log, b"");
-        }
-    }
-    // stdout/stderr 直连日志文件句柄：cmd 及子孙进程 (npx/node) 的输出全部落盘
-    let log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&dsh_log)?;
+
     let mut child = Command::new("cmd.exe")
         .args(["/c", web_cmd.as_str()])
         .current_dir(&home)
         .creation_flags(CREATE_NO_WINDOW) // 不弹出任何控制台窗口
-        .stdout(log_file.try_clone()?)
-        .stderr(log_file)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()?;
+
     // 退出竞态加固：spawn 后若收到退出请求，立即终止刚启动的进程，
     // 避免 Job 挂接前退出导致 main 尾部清理漏杀此进程树
     if quitting.load(Ordering::SeqCst) {
         let _ = child.kill();
         return Err(io::Error::new(io::ErrorKind::Interrupted, "收到退出请求"));
     }
+
+    // 先取出管道再挂 Job：读取线程持续消费输出，避免 cmd/npx/node 因管道写满而阻塞
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("无法获取 dsh stdout 管道"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("无法获取 dsh stderr 管道"))?;
+    pump_dsh_output(stdout);
+    pump_dsh_output(stderr);
+
     // 挂入 Job：DshLauncher 退出/崩溃时自动终止 dsh，不留孤儿。
     // Job 不可用 (创建或配置失败) 时拒绝启动：dsh 无法被回收 = 孤儿，不允许放行
     match job_handle() {
@@ -315,9 +342,9 @@ pub fn start_harness(quitting: &AtomicBool) -> io::Result<()> {
             ));
         }
     }
+
     crate::log::info(&format!(
-        "已启动 dsh ({web_cmd}) 并挂入 Job，输出日志 {}",
-        dsh_log.display()
+        "已启动 dsh ({web_cmd}) 并挂入 Job，输出已并入 launcher.log"
     ));
     Ok(())
 }
@@ -335,6 +362,12 @@ fn utf16le_bytes(s: &str) -> Vec<u8> {
 fn ps_encoded(script: &str) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(utf16le_bytes(script))
+}
+
+/// 以隐藏窗口执行 PowerShell 脚本并返回子进程句柄
+/// (供 update 模块发送 Windows toast 通知等一次性脚本使用)
+pub fn run_ps(script: &str) -> io::Result<Child> {
+    run_ps_hidden(script)
 }
 
 /// 以隐藏窗口 (CREATE_NO_WINDOW) 方式启动 PowerShell 进程执行脚本

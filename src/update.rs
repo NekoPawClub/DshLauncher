@@ -1,13 +1,16 @@
 //! 版本更新检测：轮询 GitHub Releases 最新版本并与本地版本比较。
 //!
 //! 检测源策略 (用户选定)：GitHub Releases API 直连为主，失败时依次尝试
-//! gh-proxy 类镜像前缀转发同一 API。全部源失败视为网络问题，静默返回错误
-//! (自动检查不打扰用户；手动检查由调用方反馈)。
+//! gh-proxy 类镜像前缀转发同一 API。全部源失败视为网络问题，静默返回错误。
+//!
+//! 提示策略：发现更新后经 Windows 系统通知 (toast) 提示一次；
+//! 去重依据为 launcher.log 中最近一条仍在 3 天保留窗口内的“更新检测成功”日志行，
+//! 同一版本在保留窗口内不重复提示，出现更新的版本后再提示。
 //!
 //! 实现要点：
 //! - WinHTTP (系统组件) 发起 HTTPS：零第三方依赖，自动走系统代理，墙内更稳
 //! - 版本号 YY.MM.DD.NN 段长不固定：按 . 分段转数值逐段比较，不能字符串字典序
-//! - 响应仅提取 tag_name 与 html_url 两个字段，手工解析 JSON，不引入 serde
+//! - 响应仅提取 tag_name 字段，手工解析 JSON，不引入 serde
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -20,64 +23,173 @@ use windows_sys::Win32::Networking::WinHttp::{
     WinHttpSetTimeouts, URL_COMPONENTS, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE,
 };
 
-/// 发布仓库：https://github.com/Antecer/DshLauncher
-const API_URL: &str = "https://api.github.com/repos/Antecer/DshLauncher/releases/latest";
+/// 发布仓库：https://github.com/NekoPawClub/DshLauncher
+const API_URL: &str = "https://api.github.com/repos/NekoPawClub/DshLauncher/releases/latest";
 /// 镜像前缀候选：主 API 失败后依次尝试 (公共 gh-proxy 实例域名可能失效，逐个静默跳过)
 const MIRROR_PREFIXES: &[&str] = &["https://ghproxy.net/", "https://ghfast.top/"];
 
 /// 检测到的新版本信息
 #[derive(Debug, Clone)]
 pub struct UpdateInfo {
-    /// 版本号 (无 v 前缀)，如 "26.8.18.1"
+    /// 版本号 (无 v 前缀)，如 "26.08.18.01"
     pub version: String,
-    /// 发布页地址
-    pub url: String,
 }
+
+/// 日志日 (凌晨 4 点为日界)：年、月、日
+type LogDay = (i64, u32, u32);
 
 /// 本地版本号 (build.rs 经 rustc-env 注入，格式 YY.MM.DD.NN)
 pub fn local_version() -> &'static str {
     env!("DSH_LAUNCHER_VERSION")
 }
 
-/// 检测最新版本。Ok(Some)=有新版；Ok(None)=已最新；Err=所有源不可达/响应无法解析。
-pub fn check_update() -> Result<Option<UpdateInfo>, ()> {
-    let local = local_version();
+/// 获取远端最新版本。Ok=成功获取并解析；Err=所有源不可达/响应无法解析。
+/// 是否“有更新”由调用方与本地版本比较决定；成功结果是否写日志也由调用方控制
+/// (启动即写一次，之后仅跨凌晨 4 点日志日或远端出现更新版本时再写)。
+fn fetch_latest_version() -> Result<UpdateInfo, ()> {
     for url in candidate_urls() {
         let Ok(body) = http_get(&url) else { continue };
         let Some(info) = parse_release_json(&body) else {
             continue;
         };
-        crate::log::info(&format!(
-            "更新检测成功：远端 v{} (本地 v{local})",
-            info.version
-        ));
-        return Ok(is_newer(local, &info.version).then_some(info));
+        return Ok(info);
     }
     Err(())
 }
 
-/// 后台检测线程：启动 30 秒后首查 (避开 dsh 拉起期间的网络繁忙)，
-/// 之后每 24 小时复查；check_now 置位时立即检查 (菜单手动触发)。
-/// 结果经 on_result(manual, result) 回调，回调在检测线程内执行。
-pub fn spawn_checker(
-    check_now: Arc<AtomicBool>,
-    quitting: Arc<AtomicBool>,
-    on_result: impl Fn(bool, Result<Option<UpdateInfo>, ()>) + Send + 'static,
-) {
+/// 后台检测线程：启动即首查一次，之后每 1 小时复查。
+/// 成功结果按日志日写入 launcher.log：进程启动写一次；运行跨过凌晨 4 点后写一次；
+/// 同一日志日内只有远端出现更新版本时才再写，避免每小时重复刷日志。
+/// 发现新版本且最近日志中未记录过该版本时发 Windows 通知 (toast)。
+pub fn spawn_checker(quitting: Arc<AtomicBool>) {
     thread::spawn(move || {
-        let mut next = Instant::now() + Duration::from_secs(30);
+        let mut next = Instant::now();
+        let mut last_written_remote: Option<String> = None;
+        let mut last_written_day: Option<LogDay> = None;
         loop {
             if quitting.load(Ordering::SeqCst) {
                 break;
             }
-            let manual = check_now.swap(false, Ordering::SeqCst);
-            if manual || Instant::now() >= next {
-                next = Instant::now() + Duration::from_secs(24 * 60 * 60);
-                on_result(manual, check_update());
+            if Instant::now() >= next {
+                next = Instant::now() + Duration::from_secs(60 * 60);
+                run_check(&mut last_written_remote, &mut last_written_day);
             }
             thread::sleep(Duration::from_millis(1000));
         }
     });
+}
+
+/// 单次检测：写入节奏由上次写入版本/日志日控制；有更新且 3 天日志内未记录时通知。
+fn run_check(last_written_remote: &mut Option<String>, last_written_day: &mut Option<LogDay>) {
+    match fetch_latest_version() {
+        Ok(info) => {
+            let local = local_version();
+
+            // 通知判断必须在写入本次检查结果之前：写入后日志里的最近版本就是当前版本，
+            // 会误判为“已提示过”。同时参考本进程已记录的版本，避免日志写入失败/
+            // 被外部删除时同一小时内重复提示。
+            if is_newer(local, &info.version) {
+                let last_logged = crate::log::last_logged_update_version();
+                let last_known =
+                    newest_version(last_logged.as_deref(), last_written_remote.as_deref());
+                if should_notify_version(&info.version, last_known) {
+                    notify_once(&info);
+                }
+            }
+
+            let today = crate::log::current_log_day();
+            if should_log_update_check(
+                &info.version,
+                last_written_remote.as_deref(),
+                *last_written_day,
+                today,
+            ) {
+                crate::log::info(&format!(
+                    "更新检测成功：远端 v{} (本地 v{local})",
+                    info.version
+                ));
+                *last_written_remote = Some(info.version);
+                *last_written_day = Some(today);
+            }
+        }
+        Err(()) => crate::log::info("更新检测失败 (网络不可达)，静默忽略"),
+    }
+}
+
+/// 去重通知：仅当远端版本比最近日志中的在线版本更新时提示一次。
+/// 在线版本日志按普通规则保留 3 天，过期后允许再次提示。
+fn notify_once(info: &UpdateInfo) {
+    crate::log::info(&format!(
+        "发现新版本 v{}，已发送 Windows 通知",
+        info.version
+    ));
+    // 图标取自当前 exe (内嵌 ICO)；路径转 file URI 供注册表 IconUri 使用
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| "DshLauncher.exe".to_string());
+    if let Err(e) = crate::dsh::run_ps(&toast_script(&info.version, &exe)) {
+        crate::log::error(&format!("发送更新通知失败：{e}"));
+    }
+}
+
+/// 是否需要提示：远端版本 > 最近日志中的在线版本 → 提示；否则不提示
+fn should_notify_version(remote: &str, last_logged: Option<&str>) -> bool {
+    match last_logged {
+        Some(last) => is_newer(last, remote),
+        None => true,
+    }
+}
+
+/// 取两个候选版本中较新的一个 (用于合并日志状态与本进程内存状态)
+fn newest_version<'a>(a: Option<&'a str>, b: Option<&'a str>) -> Option<&'a str> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if is_newer(a, b) { b } else { a }),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// 是否需要把本次在线版本写入日志：
+/// - 本进程首次检查 → 写 (对应“程序启动写一次”)
+/// - 已跨日志日 (凌晨 4 点日界) → 写 (对应“每天重新写一次”)
+/// - 同一日志日内远端出现更新版本 → 写 (对应“有新版本才写”)
+/// - 同一日志日内版本未变 → 不写
+fn should_log_update_check(
+    remote: &str,
+    last_written_remote: Option<&str>,
+    last_written_day: Option<LogDay>,
+    today: LogDay,
+) -> bool {
+    if last_written_day != Some(today) {
+        return true;
+    }
+    match last_written_remote {
+        Some(last) => is_newer(last, remote),
+        None => true,
+    }
+}
+
+/// Windows toast 通知脚本 (PowerShell WinRT)：
+/// 先注册自有 AUMID (NekoPawClub.DshLauncher：显示名 DshLauncher + exe 内嵌图标)，
+/// 再用自有 AUMID 发通知——通知中心显示为 DshLauncher 而非 Windows PowerShell。
+/// 注册在 HKCU 下进行，无需管理员权限，幂等执行。
+fn toast_script(version: &str, exe_path: &str) -> String {
+    format!(
+        r#"$ErrorActionPreference = 'SilentlyContinue'
+$regPath = 'HKCU:\Software\Classes\AppUserModelId\NekoPawClub.DshLauncher'
+if (-not (Test-Path $regPath)) {{ New-Item -Path $regPath -Force | Out-Null }}
+Set-ItemProperty -Path $regPath -Name DisplayName -Value 'DshLauncher'
+Set-ItemProperty -Path $regPath -Name IconUri -Value ('file:///{exe_path}'.Replace(' ', '%20'))
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime] | Out-Null
+$xmlText = '<toast activationType="protocol" launch="https://github.com/NekoPawClub/DshLauncher/releases"><visual><binding template="ToastGeneric"><text>DshLauncher 新版本 v{version}</text><text>点击通知打开下载页面</text></binding></visual></toast>'
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml($xmlText)
+$toast = New-Object Windows.UI.Notifications.ToastNotification $xml
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('NekoPawClub.DshLauncher').Show($toast)
+"#
+    )
 }
 
 /// 候选 URL：主 API 优先；环境变量 DSHLAUNCHER_UPDATE_MIRROR 可自定义镜像前缀
@@ -120,13 +232,12 @@ pub fn is_newer(local: &str, remote: &str) -> bool {
     }
 }
 
-/// 从 GitHub Releases API 响应中提取 tag_name 与 html_url (手工解析，零依赖)
+/// 从 GitHub Releases API 响应中提取 tag_name (手工解析，零依赖)
 fn parse_release_json(body: &str) -> Option<UpdateInfo> {
     let tag = extract_json_string(body, "tag_name")?;
-    let url = extract_json_string(body, "html_url")?;
     let version = tag.trim_start_matches('v').to_string();
     parse_version(&version)?;
-    Some(UpdateInfo { version, url })
+    Some(UpdateInfo { version })
 }
 
 /// 提取 JSON 字符串字段 "key":"value" 的 value，处理常见转义
@@ -310,6 +421,87 @@ mod tests {
     }
 
     #[test]
+    fn toast_script_registers_own_aumid() {
+        let s = toast_script("26.08.18.01", "C:/Users/test/DshLauncher.exe");
+        assert!(s.contains("NekoPawClub.DshLauncher"), "应注册自有 AUMID");
+        assert!(s.contains("DisplayName"), "应设置显示名");
+        assert!(s.contains("DshLauncher 新版本 v26.08.18.01"));
+        assert!(s.contains("file:///C:/Users/test/DshLauncher.exe"));
+        assert!(
+            !s.contains("WindowsPowerShell"),
+            "不应再借用 PowerShell AUMID"
+        );
+        assert!(
+            s.contains("activationType=\"protocol\"")
+                && s.contains("launch=\"https://github.com/NekoPawClub/DshLauncher/releases\""),
+            "点击通知应打开下载页面"
+        );
+    }
+
+    #[test]
+    fn notify_dedupe_by_logged_online_version() {
+        // 首次 (日志中无在线版本记录) → 提示
+        assert!(should_notify_version("26.08.18.01", None));
+        // 同版本重复 → 不再提示
+        assert!(!should_notify_version("26.08.18.01", Some("26.08.18.01")));
+        // 出现更新的版本 → 再提示
+        assert!(should_notify_version("26.08.18.02", Some("26.08.18.01")));
+        // 回退到旧版本 → 不提示
+        assert!(!should_notify_version("26.08.18.01", Some("26.08.18.02")));
+
+        // 日志状态与本进程内存状态取较新者，日志写入失败时仍可抑制重复提示
+        assert_eq!(
+            newest_version(None, Some("26.08.18.01")),
+            Some("26.08.18.01")
+        );
+        assert_eq!(
+            newest_version(Some("26.08.18.01"), Some("26.08.18.02")),
+            Some("26.08.18.02")
+        );
+        assert!(!should_notify_version(
+            "26.08.18.02",
+            newest_version(Some("26.08.18.01"), Some("26.08.18.02"))
+        ));
+    }
+
+    #[test]
+    fn update_check_logged_once_per_startup_or_log_day() {
+        let today = (2026, 8, 18);
+        let next_day = (2026, 8, 19);
+
+        // 进程首次检查 → 写日志
+        assert!(should_log_update_check("26.08.18.01", None, None, today));
+        // 同一日志日版本未变 → 不写
+        assert!(!should_log_update_check(
+            "26.08.18.01",
+            Some("26.08.18.01"),
+            Some(today),
+            today
+        ));
+        // 同一日志日出现更新版本 → 写
+        assert!(should_log_update_check(
+            "26.08.18.02",
+            Some("26.08.18.01"),
+            Some(today),
+            today
+        ));
+        // 同一日志日回退到旧版本 → 不写
+        assert!(!should_log_update_check(
+            "26.08.18.01",
+            Some("26.08.18.02"),
+            Some(today),
+            today
+        ));
+        // 跨过日志日 (凌晨 4 点日界) → 即使版本未变也写一次
+        assert!(should_log_update_check(
+            "26.08.18.02",
+            Some("26.08.18.02"),
+            Some(today),
+            next_day
+        ));
+    }
+
+    #[test]
     fn version_padded_segments_normalized() {
         // 补零格式与历史非补零格式数值等价
         assert_eq!(parse_version("26.08.05.01"), Some((26, 8, 5, 1)));
@@ -325,8 +517,8 @@ mod tests {
     #[test]
     fn release_json_extracts_fields() {
         let body = r#"{
-            "url": "https://api.github.com/repos/Antecer/DshLauncher/releases/1",
-            "html_url": "https://github.com/Antecer/DshLauncher/releases/tag/v26.8.18.1",
+            "url": "https://api.github.com/repos/NekoPawClub/DshLauncher/releases/1",
+            "html_url": "https://github.com/NekoPawClub/DshLauncher/releases/tag/v26.8.18.1",
             "id": 1,
             "tag_name": "v26.8.18.1",
             "name": "v26.8.18.1",
@@ -334,16 +526,15 @@ mod tests {
         }"#;
         let info = parse_release_json(body).expect("应解析成功");
         assert_eq!(info.version, "26.8.18.1");
-        assert_eq!(
-            info.url,
-            "https://github.com/Antecer/DshLauncher/releases/tag/v26.8.18.1"
-        );
     }
 
     #[test]
     fn json_escape_handled() {
-        let body = r#"{"tag_name":"v26.8.18.1","html_url":"https:\/\/github.com\/x"}"#;
-        let info = parse_release_json(body).expect("转义应正确处理");
-        assert_eq!(info.url, "https://github.com/x");
+        // extract_json_string 对常见 JSON 转义的处理 (如 \/ 反斜杠斜杠)
+        let body = r#"{"html_url":"https:\/\/github.com\/x","tag_name":"v26.8.18.1"}"#;
+        assert_eq!(
+            extract_json_string(body, "html_url").as_deref(),
+            Some("https://github.com/x")
+        );
     }
 }

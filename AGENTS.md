@@ -11,7 +11,7 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 - 目录结构：
   - `src/main.rs`：托盘、菜单、watchdog、启动流程、动画
   - `src/dsh.rs`：dsh 进程控制 (启动/停止/端口探测)、ShellExecuteW、COM 脚本、单实例
-  - `src/log.rs`：单文件日志 `launcher.log` (按行时间标签 + 凌晨 4 点日界，保留 3 天)
+  - `src/log.rs`：单文件日志 `launcher.log` (启动器事件 + dsh 输出 `[DSH]`，按行时间标签 + 凌晨 4 点日界，保留 3 天；更新检测/通知记录按普通日志清理)
   - `build.rs`：把 icons 下的 ICO 嵌入 PE 资源 (桌面 exe 图标)
   - `icons/`：DeepSeekHarness-WhaleGirl.ico (256x256，唯一图标源)
   - `Cargo.toml`：bin 名 `DshLauncher`，release 带 lto+strip
@@ -83,7 +83,7 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 
 ### dsh 启动与输出日志 (dsh.rs)
 - start_harness 直接用 `Command::new("cmd.exe")` + `creation_flags(CREATE_NO_WINDOW)` 启动 `cmd /c npx -y @deepseek-ai/dsh web`，不再经 PowerShell Start-Process 中转
-- stdout/stderr 句柄直连 `~/.dsh/dsh.log` (追加写，超过 1 MiB 启动前清空)：npx/node 的全部输出落盘，启动卡顿/失败从此定位 (2026-08-18 曾两次 120 秒超时但无任何线索可查)
+- stdout/stderr 由读取线程逐行写入 `~/.dsh/launcher.log` (时间标签 + `[DSH]` 标记，与启动器日志合并，随 3 天清理)：npx/node 的全部输出落盘，启动卡顿/失败从此定位 (2026-08-18 曾两次 120 秒超时但无任何线索可查)；不再使用单独的 `dsh.log` 与 1 MiB 清空逻辑
 - 进程树为 cmd→npx→node：cmd 挂入全局 Job，子孙进程自动进 Job
 
 ### 打开资源管理器配置目录
@@ -105,12 +105,13 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 
 ## 更新检测
 
-- 检测源：GitHub Releases API 直连为主 (`https://api.github.com/repos/Antecer/DshLauncher/releases/latest`)，失败依次尝试 gh-proxy 镜像前缀 (ghproxy.net、ghfast.top)；环境变量 `DSHLAUNCHER_UPDATE_MIRROR` 可自定义镜像前缀 (逗号分隔)，置于内置候选之前
+- 检测源：GitHub Releases API 直连为主 (`https://api.github.com/repos/NekoPawClub/DshLauncher/releases/latest`)，失败依次尝试 gh-proxy 镜像前缀 (ghproxy.net、ghfast.top)；环境变量 `DSHLAUNCHER_UPDATE_MIRROR` 可自定义镜像前缀 (逗号分隔)，置于内置候选之前
 - 实现：WinHTTP (windows-sys `Win32_Networking_WinHttp`)，零第三方依赖，自动走系统代理；单请求超时 解析 3s/连接 5s/发送 8s/接收 8s
 - 版本比较：`YY.MM.DD.NN` 按 . 分段转数值逐段比较 (段长不固定，字符串字典序会误判)；本地版本由 build.rs 经 rustc-env 注入 (`env!("DSH_LAUNCHER_VERSION")`)
-- 检测节奏：启动 30 秒后首查，之后每 24 小时复查；菜单"检查更新"置位原子标志即时触发
-- 反馈：发现新版 → 菜单项文本变"更新到 vXX" + tooltip 附加"· 新版本 vXX"，点击打开发布页；手动检查无新版 → 菜单文本"已是最新版本"；手动检查失败 → "检查失败，点击重试"；自动检查失败静默 (仅日志)
-- 发布页地址来自 API 响应的 html_url 字段，与 tag_name 一起手工解析 (零 serde)
+- 检测节奏：启动即首查一次，之后每 1 小时复查；检测线程直接发 Windows 通知 (toast)，不占用主线程
+- 结果写日志节奏：成功的在线版本写 `更新检测成功：远端 vX (本地 vY)`；进程启动写一次，跨凌晨 4 点日志日写一次，同一日志日内仅远端出现更新版本时增写，避免每小时重复刷日志
+- 提示去重：发现更新后经 PowerShell WinRT 发系统通知 (点击通知用默认浏览器打开下载页面，activationType=protocol)；发送前在 HKCU 注册自有 AUMID (NekoPawClub.DshLauncher：显示名 DshLauncher + exe 内嵌图标)，通知中心显示为 DshLauncher；去重依据为 launcher.log 中最近 3 天保留窗口内最后一条“更新检测成功”记录的在线版本 (更新检测/通知行都按普通日志清理，不永久保留)，同一版本在保留窗口内不重复提示，出现更新的版本后再提示；检测失败静默 (仅日志)
+- 远端版本来自 API 响应的 tag_name 字段，手工解析 (零 serde)
 
 ## 构建
 

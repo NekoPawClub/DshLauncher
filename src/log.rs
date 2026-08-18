@@ -2,11 +2,11 @@
 //! 仅保留最近 3 天，过时日志按每行开头的时间标签清理。
 //!
 //! 守护程序无控制台窗口，故障诊断依赖此日志。
-//! 记录点：watchdog 端口状态与拉起、启动流程起止、Job 操作成败、stop 脚本执行。
-//! dsh 子进程 (npx/node) 的输出写入同目录 dsh.log (测试实例 dsh-<instance>.log)。
+//! 记录点：watchdog 端口状态与拉起、启动流程起止、Job 操作成败、stop 脚本执行、
+//! dsh 子进程 (npx/node) 输出、更新检测与更新通知。
 
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -23,7 +23,7 @@ static LOG_LOCK: Mutex<()> = Mutex::new(());
 static LAST_CLEANUP: Mutex<Option<(i64, u32, u32)>> = Mutex::new(None);
 
 /// 日志目录：DSHLAUNCHER_LOG_DIR 覆盖 (沙箱/CI 调试钩子)，否则 %USERPROFILE%\.dsh
-fn log_base_dir() -> PathBuf {
+pub(crate) fn log_base_dir() -> PathBuf {
     match std::env::var("DSHLAUNCHER_LOG_DIR") {
         Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
         _ => {
@@ -54,13 +54,6 @@ fn log_file_name() -> String {
 /// 当前日志文件路径：{base}/launcher.log (测试实例为 launcher-<instance>.log)
 fn log_path() -> PathBuf {
     log_base_dir().join(log_file_name())
-}
-
-/// dsh 子进程输出日志：{base}/dsh.log (测试实例为 dsh-<instance>.log)
-/// start_harness 把 dsh 启动命令的 stdout/stderr 追加写入此文件，
-/// 启动卡顿/失败时由此定位原因
-pub fn dsh_log_path() -> PathBuf {
-    log_base_dir().join(format!("dsh{}.log", instance_suffix()))
 }
 
 /// 本地时间戳 YYYY-MM-DD HH:MM:SS
@@ -102,7 +95,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 /// 当前时刻归属的日志日 (凌晨 4 点前归前一天)
-fn current_log_day() -> (i64, u32, u32) {
+pub(crate) fn current_log_day() -> (i64, u32, u32) {
     unsafe {
         let mut st: SYSTEMTIME = std::mem::zeroed();
         GetLocalTime(&mut st);
@@ -143,8 +136,61 @@ fn parse_timestamp(line: &str) -> Option<SYSTEMTIME> {
     })
 }
 
+/// 从“更新检测成功”日志行提取远端版本号与该行归属的日志日。
+/// 只识别时间标签后紧跟 [INFO] 的 launcher 日志行，避免混入的 dsh 输出误命中。
+fn parse_update_check_line(line: &str) -> Option<(String, (i64, u32, u32))> {
+    let st = parse_timestamp(line)?;
+    let message = line.get("YYYY-MM-DD HH:MM:SS".len()..)?;
+    let message = message.strip_prefix(" [INFO] ")?;
+    let message = message.strip_prefix("更新检测成功：远端 v")?;
+    let version = message
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect::<String>();
+    if version.is_empty() {
+        return None;
+    }
+    Some((version, log_day_of(&st)))
+}
+
+/// 读取 launcher.log 中最近一次写入的在线版本号 (流式扫描，避免大日志整体读入内存)。
+/// 只统计仍在 3 天保留窗口内的检查行；过期的检查行等同不存在，
+/// 下次检查会重新写入并允许再次提示。
+pub(crate) fn last_logged_update_version() -> Option<String> {
+    let _guard = LOG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let today = current_log_day();
+    let cutoff = days_from_civil(today.0, today.1, today.2) - (KEEP_DAYS - 1);
+    let file = File::open(log_path()).ok()?;
+    scan_last_logged_update_version(BufReader::new(file), cutoff)
+}
+
+/// 从任意 BufRead 流中扫描 3 天窗口内最后一条在线版本记录
+/// (从文件读取逻辑拆出，便于测试)
+fn scan_last_logged_update_version<R: BufRead>(mut reader: R, cutoff: i64) -> Option<String> {
+    let mut buf = Vec::new();
+    let mut last = None;
+    loop {
+        buf.clear();
+        let n = match reader.read_until(b'\n', &mut buf) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if n == 0 {
+            break;
+        }
+        let line = String::from_utf8_lossy(&buf);
+        if let Some((version, day)) = parse_update_check_line(&line) {
+            if days_from_civil(day.0, day.1, day.2) >= cutoff {
+                last = Some(version);
+            }
+        }
+    }
+    last
+}
+
 /// 判断一行日志是否应保留：无时间标签的行保留；有时间标签的按日志日 (凌晨 4 点日界)
 /// 判断是否早于 cutoff (自 1970-01-01 的天数)。
+/// 更新检测行与更新通知行都按普通日志参与 3 天清理，不永久保留。
 fn should_keep_log_line(line: &str, cutoff: i64) -> bool {
     match parse_timestamp(line) {
         Some(st) => {
@@ -252,6 +298,11 @@ pub fn info(msg: &str) {
     write("INFO", msg);
 }
 
+/// 记录一行 dsh 子进程输出 (stdout/stderr 合并写入 launcher.log)
+pub(crate) fn dsh_output(line: &str) {
+    write("DSH", line);
+}
+
 /// 记录一条 WARN 日志
 pub fn warn(msg: &str) {
     write("WARN", msg);
@@ -354,6 +405,8 @@ mod tests {
         let cutoff = days_from_civil(2026, 8, 14);
         let content = concat!(
             "2026-08-13 23:59:59 [INFO] old\n",
+            "2020-01-01 00:00:00 [INFO] 更新检测成功：远端 v20.01.01.01 (本地 v20.01.01.00)\n",
+            "2020-01-01 00:00:01 [INFO] 发现新版本 v20.01.01.01，已发送 Windows 通知\n",
             "2026-08-14 04:00:00 [INFO] keep-day-14\n",
             "no-timestamp [INFO] keep\n",
             "2026-08-15 03:59:59 [INFO] keep-day-15\n"
@@ -376,6 +429,14 @@ mod tests {
             pruned.contains("keep-day-15"),
             "按 4 点日界应保留，实际：{pruned}"
         );
+        assert!(
+            !pruned.contains("更新检测成功：远端 v20.01.01.01"),
+            "过期更新检测行应按普通日志删除，实际：{pruned}"
+        );
+        assert!(
+            !pruned.contains("发现新版本 v20.01.01.01"),
+            "过期更新通知行应按普通日志删除，实际：{pruned}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -388,5 +449,47 @@ mod tests {
             (2026, 8, 15, 3, 59, 59)
         );
         assert!(parse_timestamp("no timestamp").is_none());
+    }
+
+    /// 在线版本从“更新检测成功”日志行提取，dsh 输出与旧通知行不会误命中
+    #[test]
+    fn parse_update_check_line_reads_remote_version() {
+        let (version, day) = parse_update_check_line(
+            "2026-08-18 03:59:59 [INFO] 更新检测成功：远端 v26.08.18.01 (本地 v26.08.18.00)",
+        )
+        .expect("应解析成功");
+        assert_eq!(version, "26.08.18.01");
+        assert_eq!(day, (2026, 8, 17), "凌晨 4 点前应归前一天");
+        assert!(parse_update_check_line(
+            "2026-08-18 10:00:00 [DSH] [INFO] 更新检测成功：远端 v26.08.18.01"
+        )
+        .is_none());
+        assert!(parse_update_check_line(
+            "2026-08-18 10:00:00 [INFO] 发现新版本 v26.08.18.01，已发送 Windows 通知"
+        )
+        .is_none());
+    }
+
+    /// 只读取 3 天窗口内的在线版本记录；过期记录视为不存在
+    #[test]
+    fn scan_last_logged_update_version_respects_retention() {
+        let cutoff = days_from_civil(2026, 8, 14);
+        let content = concat!(
+            "2026-08-13 23:59:59 [INFO] 更新检测成功：远端 v26.08.13.01 (本地 v26.08.12.00)\n",
+            "2026-08-14 04:00:00 [INFO] 更新检测成功：远端 v26.08.14.01 (本地 v26.08.13.00)\n",
+            "2026-08-15 03:59:59 [INFO] 更新检测成功：远端 v26.08.15.01 (本地 v26.08.14.00)\n",
+        );
+        assert_eq!(
+            scan_last_logged_update_version(std::io::Cursor::new(content.as_bytes()), cutoff)
+                .as_deref(),
+            Some("26.08.15.01")
+        );
+
+        let expired =
+            "2026-08-13 23:59:59 [INFO] 更新检测成功：远端 v26.08.13.01 (本地 v26.08.12.00)\n";
+        assert_eq!(
+            scan_last_logged_update_version(std::io::Cursor::new(expired.as_bytes()), cutoff),
+            None
+        );
     }
 }
