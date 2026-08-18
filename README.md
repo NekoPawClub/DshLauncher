@@ -29,6 +29,12 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘启动器，使用 Rust 编写。
 
 - 产物：`target/release/DshLauncher.exe` (已内嵌图标，可直接使用或复制到桌面)。
 
+## 版本与发布
+
+- exe 版本号格式 `YY.MM.DD.NN` (年.月.日.当日第几次发布)：CI 发布时经环境变量 `DSHLAUNCHER_VERSION` 传入 build.rs 嵌入；本地构建回退 Cargo.toml 的 `YY.MM.DD` + 0
+- 推送 main 且改动涉及编译文件时，CI 自动执行两步发布：先用上一发布版本号编译并与上一 Release 产物对比 SHA256 (一致则不发布，如仅注释改动)；有变化则按北京时间当日计数生成 `vYY.MM.DD.NN` tag 与 Release (正文为上一发布以来的提交列表)
+- 纯文档改动 (README/AGENTS 等) 不触发 CI
+
 ## 端口
 
 默认使用 3080；如需覆盖，请在启动 DshLauncher 前设置环境变量 `DSHLAUNCHER_PORT`。

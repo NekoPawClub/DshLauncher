@@ -94,6 +94,15 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 - 动态生成 .rc (含 ICO 绝对路径) → 定位 rc.exe (`RC_EXE` 环境变量 → PATH → Windows Kits → VS 递归) → `rc /fo app.res` → `cargo:rustc-link-arg` 传 .res
 - 本机 rc.exe：`C:/Program Files (x86)/Windows Kits/10/bin/<ver>/x64/rc.exe`
 
+## 版本号与 CI 发布
+
+- exe 版本号格式 `YY.MM.DD.NN` (年.月.日.当日第几次发布)：CI 发布时经环境变量 `DSHLAUNCHER_VERSION` 传入 build.rs 嵌入 FILEVERSION；本地构建回退 Cargo.toml 的 `YY.MM.DD` + 0
+- build.rs 用 `rerun-if-env-changed=DSHLAUNCHER_VERSION` 保证版本变化触发重链接；`/Brepro` 链接参数把 PE 时间戳归零，同源码构建产物 hash 稳定
+- CI 发布 (push 到 main 且涉及编译文件时触发，纯文档改动不触发) 分两步：
+  1. 第一步用上一发布版本号编译 release，产物 SHA256 与上一 Release 的 DshLauncher.exe 对比：一致 (如仅注释改动) → 跳过发布；不一致 → 继续
+  2. 第二步计算当日发布号 NN (北京时间，当日已发布数 + 1)，以 `vYY.MM.DD.NN` 为 tag 与标题发布 Release，正文为上一发布以来 `git log` 的提交列表
+- 发布由 `gh release create` 完成 (自动打 tag)，workflow 需要 `permissions: contents: write`
+
 ## 构建
 
 ### 用户机器 (正常网络)

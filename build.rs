@@ -24,17 +24,9 @@ fn main() {
     // (CI 路径 D:\a\DshLauncher\... 曾触发 RC2135)；统一转正斜杠
     let ico_rc = ico_path.to_string_lossy().replace('\\', "/");
 
-    // 版本号取自 Cargo.toml (如 1.0.0 → FILEVERSION 1,0,0,0)
-    let pkg_version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "1.0.0".to_string());
-    let vparts: Vec<u32> = pkg_version
-        .split('.')
-        .map(|s| s.parse().unwrap_or(0))
-        .collect();
-    let (v1, v2, v3) = (
-        vparts.first().copied().unwrap_or(1),
-        vparts.get(1).copied().unwrap_or(0),
-        vparts.get(2).copied().unwrap_or(0),
-    );
+    // exe 版本四段 (YY.MM.DD.NN)：CI 发布时由环境变量 DSHLAUNCHER_VERSION 传入
+    // (如 26.8.18.1)；本地构建回退 Cargo.toml 的 YY.MM.DD + 0。
+    let (v1, v2, v3, v4) = exe_version();
 
     // 动态生成 rc 文件：应用图标 + 版本信息资源 (VS_VERSION_INFO)。
     // 注意：VALUE 字符串用英文，避免 rc.exe 对无 BOM UTF-8 中文的 ANSI 误读乱码
@@ -43,8 +35,8 @@ fn main() {
 1 ICON "{ico}"
 
 1 VERSIONINFO
-FILEVERSION    {v1},{v2},{v3},0
-PRODUCTVERSION {v1},{v2},{v3},0
+FILEVERSION    {v1},{v2},{v3},{v4}
+PRODUCTVERSION {v1},{v2},{v3},{v4}
 FILEOS         0x40004
 FILETYPE       0x1
 BEGIN
@@ -54,12 +46,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "DshLauncher"
             VALUE "FileDescription",  "DeepSeek Harness Tray Guardian"
-            VALUE "FileVersion",      "{v1}.{v2}.{v3}.0"
+            VALUE "FileVersion",      "{v1}.{v2}.{v3}.{v4}"
             VALUE "InternalName",     "DshLauncher"
             VALUE "LegalCopyright",   "Copyright (C) 2026 DshLauncher"
             VALUE "OriginalFilename", "DshLauncher.exe"
             VALUE "ProductName",      "DshLauncher"
-            VALUE "ProductVersion",   "{v1}.{v2}.{v3}.0"
+            VALUE "ProductVersion",   "{v1}.{v2}.{v3}.{v4}"
         END
     END
     BLOCK "VarFileInfo"
@@ -72,6 +64,7 @@ END
         v1 = v1,
         v2 = v2,
         v3 = v3,
+        v4 = v4,
     );
     let rc_file = Path::new(&out_dir).join("app.rc");
     std::fs::write(&rc_file, rc_content).expect("写入 app.rc 失败");
@@ -93,8 +86,31 @@ END
 
     // 将生成的 .res 交给链接器
     println!("cargo:rustc-link-arg={}", res_file.display());
+    // 可重现构建：PE 时间戳归零，同源码产物 hash 稳定 (CI 靠 hash 判断是否需要发布)
+    println!("cargo:rustc-link-arg=/Brepro");
     println!("cargo:rerun-if-changed=icons/DeepSeekHarness-WhaleGirl.ico");
     println!("cargo:rerun-if-env-changed=RC_EXE");
+    // 版本号变化必须触发重链接，保证产物内嵌版本准确
+    println!("cargo:rerun-if-env-changed=DSHLAUNCHER_VERSION");
+}
+
+/// exe 版本四段 (YY.MM.DD.NN)：优先环境变量 DSHLAUNCHER_VERSION
+/// (CI 发布时传入，如 26.8.18.1)，否则回退 Cargo.toml 的 YY.MM.DD + 0
+fn exe_version() -> (u32, u32, u32, u32) {
+    if let Ok(v) = std::env::var("DSHLAUNCHER_VERSION") {
+        let parts: Vec<u32> = v.split('.').filter_map(|s| s.parse().ok()).collect();
+        if parts.len() == 4 {
+            return (parts[0], parts[1], parts[2], parts[3]);
+        }
+    }
+    let pkg = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "26.8.18".to_string());
+    let parts: Vec<u32> = pkg.split('.').filter_map(|s| s.parse().ok()).collect();
+    (
+        parts.first().copied().unwrap_or(0),
+        parts.get(1).copied().unwrap_or(0),
+        parts.get(2).copied().unwrap_or(0),
+        0,
+    )
 }
 
 /// 依次尝试：环境变量 RC_EXE → PATH → Windows Kits → VS 安装目录
