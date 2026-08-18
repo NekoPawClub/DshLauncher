@@ -108,8 +108,8 @@ jobs:
         run: |
           $d = (Get-Date).ToUniversalTime().AddHours(8).ToString('yy.MM.dd')
           $existing = @(gh release list --limit 100 --json tagName --jq '.[].tagName')
-          $n = @($existing | Where-Object { $_ -match ('^v' + [regex]::Escape($d) + '\.\d+$') }).Count
-          $ver = "$d.$($n + 1)"
+          $n = @($existing | Where-Object { $_ -match ('^v' + [regex]::Escape($d) + '\.\d{2}$') }).Count
+          $ver = "$d.{0:D2}" -f ($n + 1)
           Write-Host "发布版本: v$ver (当日第 $($n + 1) 次发布)"
           "PUB_VER=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 

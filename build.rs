@@ -46,12 +46,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "DshLauncher"
             VALUE "FileDescription",  "DeepSeek Harness Tray Guardian"
-            VALUE "FileVersion",      "{v1}.{v2}.{v3}.{v4}"
+            VALUE "FileVersion",      "{v1:02}.{v2:02}.{v3:02}.{v4:02}"
             VALUE "InternalName",     "DshLauncher"
             VALUE "LegalCopyright",   "Copyright (C) 2026 DshLauncher"
             VALUE "OriginalFilename", "DshLauncher.exe"
             VALUE "ProductName",      "DshLauncher"
-            VALUE "ProductVersion",   "{v1}.{v2}.{v3}.{v4}"
+            VALUE "ProductVersion",   "{v1:02}.{v2:02}.{v3:02}.{v4:02}"
         END
     END
     BLOCK "VarFileInfo"
@@ -85,7 +85,8 @@ END
     assert!(status.success(), "rc.exe 编译资源失败 (退出码 {status})");
 
     // 运行时版本常量：update 模块据此与远端最新版本比较
-    println!("cargo:rustc-env=DSH_LAUNCHER_VERSION={v1}.{v2}.{v3}.{v4}");
+    // (四段固定两位补零，如 26.08.05.01：字符串序即版本序)
+    println!("cargo:rustc-env=DSH_LAUNCHER_VERSION={v1:02}.{v2:02}.{v3:02}.{v4:02}");
     // 将生成的 .res 交给链接器
     println!("cargo:rustc-link-arg={}", res_file.display());
     // 可重现构建：PE 时间戳归零，同源码产物 hash 稳定 (CI 靠 hash 判断是否需要发布)

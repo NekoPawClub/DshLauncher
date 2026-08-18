@@ -98,7 +98,8 @@ fn candidate_urls() -> Vec<String> {
     urls
 }
 
-/// 版本解析：YY.MM.DD.NN → 四段数值 (缺段补 0，多段/非数字返回 None)
+/// 版本解析：YY.MM.DD.NN → 四段数值 (缺段补 0，多段/非数字返回 None)。
+/// 各段固定两位补零 (如 26.08.05.01)，历史版本可能未补零，解析按数值归一化
 fn parse_version(v: &str) -> Option<(u32, u32, u32, u32)> {
     let mut parts = [0u32; 4];
     let segs: Vec<&str> = v.trim().trim_start_matches('v').split('.').collect();
@@ -306,6 +307,13 @@ mod tests {
             "本地版本格式非法：{}",
             local_version()
         );
+    }
+
+    #[test]
+    fn version_padded_segments_normalized() {
+        // 补零格式与历史非补零格式数值等价
+        assert_eq!(parse_version("26.08.05.01"), Some((26, 8, 5, 1)));
+        assert!(is_newer("26.8.5.0", "26.08.05.01"));
     }
 
     #[test]

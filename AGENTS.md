@@ -96,7 +96,7 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 
 ## 版本号与 CI 发布
 
-- exe 版本号格式 `YY.MM.DD.NN` (年.月.日.当日第几次发布)：CI 发布时经环境变量 `DSHLAUNCHER_VERSION` 传入 build.rs 嵌入 FILEVERSION；本地构建自动取构建当天本地日期 + 0 (Cargo.toml version 不参与 exe 版本)
+- exe 版本号格式 `YY.MM.DD.NN` (年.月.日.当日第几次发布，各段固定两位补零，如 26.08.05.01)：CI 发布时经环境变量 `DSHLAUNCHER_VERSION` 传入 build.rs 嵌入 FILEVERSION；本地构建自动取构建当天本地日期 + 0 (Cargo.toml version 不参与 exe 版本)
 - build.rs 用 `rerun-if-env-changed=DSHLAUNCHER_VERSION` 保证版本变化触发重链接；`/Brepro` 链接参数把 PE 时间戳归零，同源码构建产物 hash 稳定
 - CI 发布 (push 到 main 且涉及编译文件时触发，纯文档改动不触发) 分两步：
   1. 第一步用上一发布版本号编译 release，产物 SHA256 与上一 Release 的 DshLauncher.exe 对比：一致 (如仅注释改动) → 跳过发布；不一致 → 继续
