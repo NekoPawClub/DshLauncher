@@ -166,7 +166,7 @@ fn find_rc_exe() -> Option<PathBuf> {
         }
     }
 
-    // 3) Windows Kits 常见位置：bin/<版本>/<架构>/rc.exe，取最新版本、优先 x64
+    // 3) Windows Kits 常见位置：bin/<版本>/<架构>/rc.exe，取最新版本、优先主机架构
     for kits_root in [
         r"C:\Program Files (x86)\Windows Kits\10\bin",
         r"C:\Program Files\Windows Kits\10\bin",
@@ -179,7 +179,7 @@ fn find_rc_exe() -> Option<PathBuf> {
             // 按版本号数值比较 ("11.0" 必须大于 "9.0")，选最新 SDK
             versions.sort_by_key(|a| version_key(a));
             for version in versions.iter().rev() {
-                for arch in ["x64", "x86", "arm64"] {
+                for arch in preferred_archs() {
                     let p = Path::new(kits_root).join(version).join(arch).join("rc.exe");
                     if p.is_file() {
                         return Some(p);
@@ -189,20 +189,19 @@ fn find_rc_exe() -> Option<PathBuf> {
         }
     }
 
-    // 4) VS 安装目录下递归查找 (兜底)
+    // 4) VS 安装目录下递归查找 (兜底)，收集全部候选后优先主机架构
+    let mut candidates = Vec::new();
     for vs_root in [
         r"C:\Program Files\Microsoft Visual Studio",
         r"C:\Program Files (x86)\Microsoft Visual Studio",
     ] {
         if let Ok(entries) = std::fs::read_dir(vs_root) {
             for entry in entries.filter_map(|e| e.ok()) {
-                if let Some(found) = find_file_recursive(&entry.path(), "rc.exe", 5) {
-                    return Some(found);
-                }
+                find_rc_files_recursive(&entry.path(), 5, &mut candidates);
             }
         }
     }
-    None
+    pick_preferred_rc(&candidates)
 }
 
 /// 版本字符串 → 数值序列 ("10.0.22621.0" → [10, 0, 22621, 0])，用于正确选取最新 SDK
@@ -210,21 +209,60 @@ fn version_key(s: &str) -> Vec<u32> {
     s.split('.').filter_map(|p| p.parse::<u32>().ok()).collect()
 }
 
-/// 在目录树下有限深度内查找指定文件名
-fn find_file_recursive(dir: &Path, name: &str, depth: usize) -> Option<PathBuf> {
-    if depth == 0 {
-        return None;
+/// 主机架构映射为 Windows Kits 目录名。
+fn host_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "x86" => "x86",
+        "aarch64" => "arm64",
+        _ => "x64",
     }
-    let entries = std::fs::read_dir(dir).ok()?;
+}
+
+/// 返回 rc.exe 架构目录的查找顺序：主机架构优先，其余作为兜底。
+fn preferred_archs() -> Vec<&'static str> {
+    let host = host_arch();
+    let mut archs = vec![host];
+    for arch in ["x64", "x86", "arm64"] {
+        if arch != host {
+            archs.push(arch);
+        }
+    }
+    archs
+}
+
+/// 从路径中识别 rc.exe 所属架构。
+fn path_arch_hint(path: &Path) -> Option<&'static str> {
+    let lower = path.to_string_lossy().to_lowercase();
+    ["x64", "arm64", "x86"]
+        .into_iter()
+        .find(|arch| lower.contains(arch))
+}
+
+/// 在候选 rc.exe 中选择主机架构匹配项；匹配不到则退回第一个。
+fn pick_preferred_rc(candidates: &[PathBuf]) -> Option<PathBuf> {
+    for arch in preferred_archs() {
+        if let Some(path) = candidates.iter().find(|p| path_arch_hint(p) == Some(arch)) {
+            return Some(path.clone());
+        }
+    }
+    candidates.first().cloned()
+}
+
+/// 在目录树下有限深度内收集指定文件名的路径
+fn find_rc_files_recursive(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.is_dir() {
-            if let Some(found) = find_file_recursive(&path, name, depth - 1) {
-                return Some(found);
-            }
-        } else if path.file_name().map(|n| n == name).unwrap_or(false) {
-            return Some(path);
+            find_rc_files_recursive(&path, depth - 1, out);
+        } else if path.file_name().is_some_and(|n| n == "rc.exe") {
+            out.push(path);
         }
     }
-    None
 }

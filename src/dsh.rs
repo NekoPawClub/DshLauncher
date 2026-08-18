@@ -1,6 +1,6 @@
 //! dsh (DeepSeek Harness) 进程控制：启动、停止、页面打开、端口探测
 
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, Read};
 use std::net::TcpStream;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
@@ -8,15 +8,27 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS,
+    HANDLE, INVALID_HANDLE_VALUE,
+};
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    GetExtendedTcpTable, MIB_TCPTABLE_OWNER_PID, MIB_TCP_STATE_LISTEN, TCP_TABLE_OWNER_PID_ALL,
+};
+use windows_sys::Win32::Networking::WinSock::AF_INET;
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
-use windows_sys::Win32::System::Threading::{CreateMutexW, CREATE_NO_WINDOW, IO_COUNTERS};
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, OpenProcess, TerminateProcess, CREATE_NO_WINDOW, IO_COUNTERS, PROCESS_TERMINATE,
+};
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
@@ -183,35 +195,110 @@ pub fn open_config_dir() -> io::Result<()> {
     shell_execute_open(&dir_str)
 }
 
-/// 构造停止 dsh 的 PowerShell 脚本 (仅作为兜底：处理端口被外部进程占用、
-/// 非 Job 管理的残留；正常路径由 TerminateJobObject 秒杀，不走此脚本)：
-/// 按 Web 端口找监听进程并连同子进程树结束。
-fn stop_script_with(port: u16) -> String {
-    let port_part = r#"
-# 1) 结束监听 dsh 端口的进程及其子进程树
-netstat -ano | Select-String ("TCP\s+\S*:" + $port + "\s") | Select-String "LISTENING" | ForEach-Object {{
-    $parts = ($_.ToString().Trim() -split '\s+')
-    $procId = 0
-    if ([int]::TryParse($parts[$parts.Count - 1], [ref]$procId)) {{
-        taskkill /PID $procId /T /F 2>$null | Out-Null
-    }}
-}}
-"#
-    .to_string();
-    format!(
-        "$ErrorActionPreference = 'SilentlyContinue'\n$port = {}\n{}",
-        port, port_part
-    )
+/// 查询占用指定 IPv4 端口的监听进程 PID (GetExtendedTcpTable，纯 Win32)。
+fn listener_pids(port: u16) -> Vec<u32> {
+    unsafe {
+        let mut size: u32 = 0;
+        let ret = GetExtendedTcpTable(
+            std::ptr::null_mut(),
+            &mut size,
+            0,
+            AF_INET as u32,
+            TCP_TABLE_OWNER_PID_ALL,
+            0,
+        );
+        if ret != ERROR_INSUFFICIENT_BUFFER || size == 0 {
+            return Vec::new();
+        }
+        let mut buf = vec![0u8; size as usize];
+        let ret = GetExtendedTcpTable(
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            &mut size,
+            0,
+            AF_INET as u32,
+            TCP_TABLE_OWNER_PID_ALL,
+            0,
+        );
+        if ret != ERROR_SUCCESS {
+            return Vec::new();
+        }
+
+        let table = &*(buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID);
+        let rows = std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
+        rows.iter()
+            .filter(|row| row.dwState == MIB_TCP_STATE_LISTEN as u32)
+            .filter(|row| u16::from_be((row.dwLocalPort & 0xffff) as u16) == port)
+            .map(|row| row.dwOwningPid)
+            .collect()
+    }
 }
 
-/// 构造停止 dsh 的 PowerShell 脚本 (使用当前端口)
-fn stop_script() -> String {
-    stop_script_with(web_port())
+/// 枚举当前进程快照 (pid, parent_pid)，用于兜底清理外部进程树。
+fn process_snapshot() -> Vec<(u32, u32)> {
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                out.push((entry.th32ProcessID, entry.th32ParentProcessID));
+                entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+        out
+    }
 }
 
-/// 停止 dsh：优先 TerminateJobObject 秒杀整个进程树 (毫秒级、无 PowerShell)；
+/// 用 TerminateProcess 结束单个进程；跳过本进程。
+fn terminate_pid(pid: u32) -> bool {
+    if pid == 0 || pid == std::process::id() {
+        return false;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let ok = TerminateProcess(handle, 1) != 0;
+        CloseHandle(handle);
+        ok
+    }
+}
+
+/// 按进程快照递归结束整棵进程树 (先子后父，循环引用由 killed 列表阻断)。
+fn kill_tree_from(pid: u32, processes: &[(u32, u32)], killed: &mut Vec<u32>) {
+    if pid == 0 || killed.contains(&pid) {
+        return;
+    }
+    for &(child, parent) in processes {
+        if parent == pid && !killed.contains(&child) {
+            kill_tree_from(child, processes, killed);
+        }
+    }
+    let _ = terminate_pid(pid);
+    killed.push(pid);
+}
+
+/// 清理一组根进程及其子进程树 (纯 Win32；外部进程兜底路径)。
+fn kill_process_tree(roots: &[u32]) {
+    let processes = process_snapshot();
+    let mut killed = Vec::new();
+    for &root in roots {
+        kill_tree_from(root, &processes, &mut killed);
+    }
+}
+
+/// 停止 dsh：优先 TerminateJobObject 秒杀整个进程树 (毫秒级、无外部进程)；
 /// 若端口仍被外部进程占用 (非 Job 管理，如用户手动启动的 dsh)，
-/// 再兜底按端口清理 (罕见场景)。
+/// 再用 GetExtendedTcpTable + Toolhelp 快照按进程树兜底清理 (纯 Win32)。
 pub fn stop_harness() {
     // 1) 秒杀 Job 内进程树
     if let Some(job) = job_handle() {
@@ -224,64 +311,97 @@ pub fn stop_harness() {
     // 2) 等终止生效，检查端口是否仍被占
     thread::sleep(Duration::from_millis(300));
     if port_ready() || port_occupied() {
-        crate::log::info("端口仍被占用，执行兜底清理脚本");
-        if let Ok(mut child) = run_ps_hidden(&stop_script()) {
-            // 兜底脚本最多等 5 秒，超时强杀，避免退出流程卡死
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                if child.try_wait().ok().flatten().is_some() {
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    crate::log::warn("兜底清理脚本超时，已强制终止");
-                    break;
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
+        crate::log::info("端口仍被占用，执行纯 Win32 兜底清理");
+        let pids = listener_pids(web_port());
+        if pids.is_empty() {
+            crate::log::warn("未找到占用端口的监听进程，放弃兜底清理");
+        } else {
+            crate::log::info(&format!("终止占用端口的进程树，根 PID：{pids:?}"));
+            kill_process_tree(&pids);
         }
     }
 }
 
-/// 把 dsh 子进程的 stdout/stderr 逐行读入 launcher.log。
+/// 把 dsh 子进程的 stdout/stderr 写入 launcher.log。
 /// 子进程输出由日志模块统一加时间标签与 [DSH] 标记，因此也会参与 3 天清理，
 /// 不再需要单独的 dsh.log 与 1 MiB 清空逻辑。
-/// 读取按缓冲块切分：遇到换行即按行写入；没有换行也随缓冲块落盘，
-/// 避免 npm 进度条等无换行输出长时间滞留内存 (与原直连文件句柄的实时性一致)。
-fn pump_dsh_output<R: Read + Send + 'static>(reader: R) {
+/// 按读取块切分：遇到换行按行写入；没有换行也随块落盘，
+/// 同时保留未完成的 UTF-8 尾字节，避免多字节字符被块边界截断。
+fn pump_dsh_output<R: Read + Send + 'static>(mut reader: R) {
     thread::spawn(move || {
-        let mut reader = BufReader::with_capacity(16 * 1024, reader);
+        let mut chunk = [0u8; 16 * 1024];
+        let mut pending = Vec::new();
         loop {
-            let available = match reader.fill_buf() {
-                Ok(buf) => buf,
+            let n = match reader.read(&mut chunk) {
+                Ok(n) => n,
                 Err(e) => {
                     crate::log::error(&format!("读取 dsh 输出失败：{e}"));
                     break;
                 }
             };
-            if available.is_empty() {
+            if n == 0 {
                 break;
             }
-            let take = available
-                .iter()
-                .position(|&b| b == b'\n')
-                .map_or(available.len(), |pos| pos + 1);
-            let mut line = String::from_utf8_lossy(&available[..take]).into_owned();
-            while line.ends_with('\n') || line.ends_with('\r') {
-                line.pop();
+            pending.extend_from_slice(&chunk[..n]);
+
+            while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = pending.drain(..=pos).collect();
+                log_dsh_bytes(&line);
             }
-            crate::log::dsh_output(&line);
-            reader.consume(take);
+            flush_partial_dsh_bytes(&mut pending);
+        }
+        if !pending.is_empty() {
+            log_dsh_bytes(&pending);
         }
     });
 }
 
+/// 去除行尾 CR/LF 后写入日志。
+fn log_dsh_bytes(bytes: &[u8]) {
+    let mut end = bytes.len();
+    while end > 0 && (bytes[end - 1] == b'\n' || bytes[end - 1] == b'\r') {
+        end -= 1;
+    }
+    crate::log::dsh_output(&String::from_utf8_lossy(&bytes[..end]));
+}
+
+/// 把没有换行的块立即落盘，但保留末尾不完整的 UTF-8 序列；
+/// 无法继续等待的非法 UTF-8 字节则按 lossy 方式落盘，避免 pending 无限增长。
+fn flush_partial_dsh_bytes(pending: &mut Vec<u8>) {
+    if pending.is_empty() {
+        return;
+    }
+    let valid_len = match std::str::from_utf8(pending) {
+        Ok(_) => pending.len(),
+        Err(e) => e.valid_up_to(),
+    };
+    if valid_len > 0 {
+        let valid: Vec<u8> = pending.drain(..valid_len).collect();
+        log_dsh_bytes(&valid);
+    }
+    if pending.is_empty() {
+        return;
+    }
+    if let Err(e) = std::str::from_utf8(pending) {
+        if e.error_len().is_some() {
+            let invalid = std::mem::take(pending);
+            log_dsh_bytes(&invalid);
+        }
+    }
+}
+
+/// 用 Toolhelp 快照递归清理整棵进程树 (仅在 Job 不可用/挂接失败时使用)。
+fn kill_child_tree(child: &mut Child) {
+    let pid = child.id();
+    kill_process_tree(&[pid]);
+}
+
 /// 后台隐藏窗口启动 dsh：npx @deepseek-ai/dsh web (工作目录为用户主目录)。
 /// 端口覆盖时透传 --port；-y 避免 npx 首次安装的交互确认。
-/// cmd/npx/node 的 stdout 与 stderr 由读取线程逐行写入 launcher.log
+/// cmd/npx/node 的 stdout 与 stderr 由读取线程写入 launcher.log
 /// (时间标签 + [DSH] 标记)，与启动器日志合并，不再使用单独的 dsh.log。
-/// 启动后立即把进程树挂入全局 Job (KILL_ON_JOB_CLOSE)。
-/// quitting：退出请求标志，spawn 后立即检查，避免退出竞态导致进程树漏挂 Job。
+/// spawn 后立即挂入全局 Job (KILL_ON_JOB_CLOSE)，再检查退出请求：
+/// 任何失败路径都清理整棵进程树，避免 cmd 已派生 npx/node 后留下孤儿。
 pub fn start_harness(quitting: &AtomicBool) -> io::Result<()> {
     let home = home_dir();
     let port = web_port();
@@ -299,14 +419,36 @@ pub fn start_harness(quitting: &AtomicBool) -> io::Result<()> {
         .stderr(Stdio::piped())
         .spawn()?;
 
-    // 退出竞态加固：spawn 后若收到退出请求，立即终止刚启动的进程，
-    // 避免 Job 挂接前退出导致 main 尾部清理漏杀此进程树
+    // 先挂入 Job，再检查退出请求：确保任何终止动作都覆盖 npx/node 整棵树。
+    let job = match job_handle() {
+        Some(job) => job,
+        None => {
+            kill_child_tree(&mut child);
+            return Err(io::Error::other(
+                "Job 对象不可用 (dsh 将无法被自动回收)，拒绝启动",
+            ));
+        }
+    };
+    unsafe {
+        use std::os::windows::io::AsRawHandle;
+        if AssignProcessToJobObject(job, child.as_raw_handle()) == 0 {
+            let err = io::Error::last_os_error();
+            crate::log::error(&format!(
+                "AssignProcessToJobObject 失败 (dsh 将无法被 Job 回收)：{err}"
+            ));
+            kill_child_tree(&mut child);
+            return Err(err);
+        }
+    }
+
     if quitting.load(Ordering::SeqCst) {
-        let _ = child.kill();
+        unsafe {
+            TerminateJobObject(job, 1);
+        }
         return Err(io::Error::new(io::ErrorKind::Interrupted, "收到退出请求"));
     }
 
-    // 先取出管道再挂 Job：读取线程持续消费输出，避免 cmd/npx/node 因管道写满而阻塞
+    // Job 已挂接成功，取出管道并启动读取线程，避免 cmd/npx/node 因管道写满而阻塞
     let stdout = child
         .stdout
         .take()
@@ -318,71 +460,10 @@ pub fn start_harness(quitting: &AtomicBool) -> io::Result<()> {
     pump_dsh_output(stdout);
     pump_dsh_output(stderr);
 
-    // 挂入 Job：DshLauncher 退出/崩溃时自动终止 dsh，不留孤儿。
-    // Job 不可用 (创建或配置失败) 时拒绝启动：dsh 无法被回收 = 孤儿，不允许放行
-    match job_handle() {
-        Some(job) => {
-            use std::os::windows::io::AsRawHandle;
-            unsafe {
-                // 挂接失败：dsh 将成孤儿，视为启动失败并终止刚启动的进程
-                if AssignProcessToJobObject(job, child.as_raw_handle()) == 0 {
-                    let err = io::Error::last_os_error();
-                    crate::log::error(&format!(
-                        "AssignProcessToJobObject 失败 (dsh 将无法被 Job 回收)：{err}"
-                    ));
-                    let _ = child.kill();
-                    return Err(err);
-                }
-            }
-        }
-        None => {
-            let _ = child.kill();
-            return Err(io::Error::other(
-                "Job 对象不可用 (dsh 将无法被自动回收)，拒绝启动",
-            ));
-        }
-    }
-
     crate::log::info(&format!(
         "已启动 dsh ({web_cmd}) 并挂入 Job，输出已并入 launcher.log"
     ));
     Ok(())
-}
-
-/// 把字符串编码为 UTF-16LE 字节序列 (-EncodedCommand 用)
-fn utf16le_bytes(s: &str) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(s.len() * 2);
-    for unit in s.encode_utf16() {
-        bytes.extend_from_slice(&unit.to_le_bytes());
-    }
-    bytes
-}
-
-/// 将 PowerShell 脚本编码为 UTF-16LE + Base64 (-EncodedCommand 免转义)
-fn ps_encoded(script: &str) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(utf16le_bytes(script))
-}
-
-/// 以隐藏窗口执行 PowerShell 脚本并返回子进程句柄
-/// (供 update 模块发送 Windows toast 通知等一次性脚本使用)
-pub fn run_ps(script: &str) -> io::Result<Child> {
-    run_ps_hidden(script)
-}
-
-/// 以隐藏窗口 (CREATE_NO_WINDOW) 方式启动 PowerShell 进程执行脚本
-fn run_ps_hidden(script: &str) -> io::Result<Child> {
-    Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-WindowStyle",
-            "Hidden",
-            "-EncodedCommand",
-            &ps_encoded(script),
-        ])
-        .creation_flags(CREATE_NO_WINDOW) // 不弹出任何控制台窗口
-        .spawn()
 }
 
 /// 释放单实例互斥体 (退出流程提前调用，让新实例在旧进程退出前即可启动)
@@ -396,8 +477,9 @@ pub fn release_single_instance(handle: HANDLE) {
 /// 环境变量 DSHLAUNCHER_INSTANCE 可附加互斥体后缀 (测试实例隔离用，
 /// 让测试实例与用户实例互不干扰)。
 pub fn single_instance_guard() -> Option<HANDLE> {
-    let suffix = std::env::var("DSHLAUNCHER_INSTANCE").unwrap_or_default();
-    let name_str = format!("Local\\DshLauncher.SingleInstance{}", suffix);
+    // 与日志文件后缀共用同一套清洗规则，避免同名实例却写入不同日志/互斥体
+    let suffix = crate::log::instance_id();
+    let name_str = format!("Local\\DshLauncher.SingleInstance{suffix}");
     let name = to_wide(&name_str);
     unsafe {
         let handle = CreateMutexW(std::ptr::null(), 1, name.as_ptr());
@@ -437,31 +519,69 @@ mod tests {
     }
 
     #[test]
-    fn ps_encoded_roundtrip() {
-        use base64::Engine;
-        let s = "中文 '引号' \\反斜杠\n多行";
-        let enc = ps_encoded(s);
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(enc)
+    fn kill_process_tree_terminates_child_process() {
+        let mut child = Command::new("cmd.exe")
+            .args(["/c", "ping -n 30 127.0.0.1 >nul"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
             .unwrap();
-        let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        assert_eq!(String::from_utf16(&units).unwrap(), s);
+        kill_process_tree(&[child.id()]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if child.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "子进程未在 5 秒内被终止"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[test]
-    fn stop_script_keeps_regex_escapes() {
-        let s = stop_script_with(3080);
-        assert!(s.contains(r"TCP\s+\S*:"), "端口正则转义必须保留，实际：{s}");
-        assert!(s.contains("$port = 3080"));
+    fn listener_pids_finds_current_process() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let pids = listener_pids(port);
+        assert!(
+            pids.contains(&std::process::id()),
+            "应在监听端口 {port} 的 PID 列表中找到当前进程，实际：{pids:?}"
+        );
+        drop(listener);
     }
 
+    /// 防回归：应用运行时代码不得通过 PowerShell/netstat/taskkill 代理实现功能。
+    /// 只扫描本机源码文本中的精确 Command::new 调用；历史注释中的单词不会误伤。
     #[test]
-    fn stop_script_uses_given_port() {
-        let s = stop_script_with(39999);
-        assert!(s.contains("$port = 39999"));
+    fn runtime_source_has_no_shell_proxies() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let files = [
+            root.join("Cargo.toml"),
+            root.join("build.rs"),
+            root.join("src/main.rs"),
+            root.join("src/dsh.rs"),
+            root.join("src/log.rs"),
+            root.join("src/toast.rs"),
+            root.join("src/update.rs"),
+        ];
+        for path in files {
+            let text = std::fs::read_to_string(&path).unwrap();
+            for exe in ["powershell", "netstat", "taskkill"] {
+                let needle = format!("Command::new(\"{}.exe\")", exe);
+                assert!(
+                    !text.contains(&needle),
+                    "运行时代码禁止代理调用 {exe}.exe：{}",
+                    path.display()
+                );
+            }
+            let encoded = format!("-{}", "EncodedCommand");
+            assert!(
+                !text.contains(&encoded),
+                "运行时代码禁止 PowerShell EncodedCommand：{}",
+                path.display()
+            );
+        }
     }
 
     #[test]

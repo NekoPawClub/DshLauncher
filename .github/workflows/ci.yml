@@ -36,13 +36,14 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy (警告即失败)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: 单元测试
-        run: cargo test
+        run: cargo test --locked
 
-  # 两步编译发布：先用上一发布版本号编译并对比产物 hash，
-  # 一致 (如仅注释改动) 则不发布；有变化才用当日版本号重编译并发布
+
+  # 发布判断改为源码比对：git diff -b 忽略缩进/空白数量变化，
+  # 只有影响编译产物的文件发生实质内容变化时才发布
   release:
     needs: check
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -60,46 +61,38 @@ jobs:
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
 
-      - name: 定位上一发布版本并下载其产物
+      - name: 定位上一发布版本
         shell: pwsh
         run: |
           $prevTag = (gh release list --limit 1 --json tagName --jq '.[0].tagName') 2>$null
           if ([string]::IsNullOrEmpty($prevTag)) {
-            Write-Host "无历史发布：跳过产物对比，直接进入发布流程"
+            Write-Host "无历史发布：直接进入发布流程"
             "PREV_TAG=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-            "PREV_HASH=none" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "HAS_PREV=0" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
             exit 0
           }
           Write-Host "上一发布: $prevTag"
           "PREV_TAG=$prevTag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "PREV_VER=$($prevTag.TrimStart('v'))" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          gh release download $prevTag --pattern 'DshLauncher.exe' --dir prev
-          if ($LASTEXITCODE -ne 0 -or -not (Test-Path 'prev/DshLauncher.exe')) {
-            Write-Host "上一发布产物获取失败：视为有变化，直接进入发布流程"
-            "PREV_HASH=none" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-            exit 0
-          }
-          $h = (Get-FileHash 'prev/DshLauncher.exe' -Algorithm SHA256).Hash
-          Write-Host "上一发布产物 SHA256: $h"
-          "PREV_HASH=$h" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "HAS_PREV=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: 第一步编译 (沿用上一发布版本号，产物用于 hash 对比)
-        if: env.PREV_HASH != 'none'
-        env:
-          DSHLAUNCHER_VERSION: ${{ env.PREV_VER }}
-        run: cargo build --release
-
-      - name: 对比产物 hash
-        if: env.PREV_HASH != 'none'
+      - name: 比对源码变化 (忽略缩进/空白数量变化)
         shell: pwsh
         run: |
-          $cur = (Get-FileHash 'target/release/DshLauncher.exe' -Algorithm SHA256).Hash
-          Write-Host "本次编译产物 SHA256: $cur"
-          if ($cur -eq $env:PREV_HASH) {
-            Write-Host "产物与上一发布完全一致 (仅注释等非代码改动)，跳过发布"
-            "SKIP_RELEASE=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if ($env:HAS_PREV -ne '1') {
+            Write-Host "无历史发布：直接计算版本并发布"
+            exit 0
+          }
+          $files = @(git diff -b --name-only "$($env:PREV_TAG)..HEAD")
+          if ($LASTEXITCODE -ne 0) { Write-Error "git diff 失败"; exit 1 }
+          $codeFiles = @($files | Where-Object {
+            $_ -match '^(Cargo\.toml|Cargo\.lock|build\.rs|src/|icons/)'
+          })
+          if ($codeFiles.Count -gt 0) {
+            Write-Host "以下编译相关文件存在非缩进变化:"
+            $codeFiles | ForEach-Object { Write-Host "  $_" }
           } else {
-            Write-Host "产物有变化，继续发布流程"
+            Write-Host "编译相关源码无实质变化，跳过发布"
+            "SKIP_RELEASE=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
 
       - name: 计算发布版本号 (YY.MM.DD.NN，北京时间当日计数)
@@ -113,11 +106,11 @@ jobs:
           Write-Host "发布版本: v$ver (当日第 $($n + 1) 次发布)"
           "PUB_VER=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: 第二步编译 (正式版本号)
+      - name: 编译正式版本号产物
         if: env.SKIP_RELEASE != '1'
         env:
           DSHLAUNCHER_VERSION: ${{ env.PUB_VER }}
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: 发布 Release 并打 tag
         if: env.SKIP_RELEASE != '1'

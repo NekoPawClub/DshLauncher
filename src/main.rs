@@ -14,6 +14,7 @@
 
 mod dsh;
 mod log;
+mod toast;
 mod update;
 
 use std::error::Error;
@@ -42,6 +43,10 @@ enum UserEvent {
     },
     /// tooltip 状态更新：dsh 运行状态显示
     TooltipUpdate {
+        ready: bool,
+    },
+    /// 后台端口探测完成：“打开”菜单不再阻塞主线程等待探测结果
+    OpenProbeDone {
         ready: bool,
     },
 }
@@ -107,19 +112,32 @@ fn spawn_startup_flow(
         }
 
         let mut ready = dsh::port_ready();
-        if !ready && dsh::start_harness(&quitting).is_ok() {
-            // 轮询端口就绪 (500ms 间隔，最长 120 秒)
-            let deadline = Instant::now() + Duration::from_secs(120);
-            while !ready && Instant::now() < deadline && !quitting.load(Ordering::SeqCst) {
-                ready = dsh::port_ready();
-                if ready {
-                    break;
+        let mut waited_for_port = false;
+        if !ready {
+            match dsh::start_harness(&quitting) {
+                Ok(()) => {
+                    // 轮询端口就绪 (500ms 间隔，最长 120 秒)
+                    waited_for_port = true;
+                    let deadline = Instant::now() + Duration::from_secs(120);
+                    while !ready && Instant::now() < deadline && !quitting.load(Ordering::SeqCst) {
+                        ready = dsh::port_ready();
+                        if ready {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(500));
+                    }
                 }
-                thread::sleep(Duration::from_millis(500));
+                Err(e) => {
+                    log::error(&format!("启动 dsh 失败：{e}"));
+                }
             }
         }
         if !ready && !quitting.load(Ordering::SeqCst) {
-            log::warn("等待 dsh 端口就绪超时 (120 秒)，watchdog 将重试");
+            if waited_for_port {
+                log::warn("等待 dsh 端口就绪超时 (120 秒)，watchdog 将重试");
+            } else {
+                log::warn("dsh 启动失败，watchdog 将重试");
+            }
         }
 
         // 就绪后停止动画 (若在播放)
@@ -240,23 +258,25 @@ impl App {
         let _ = self.tray.set_tooltip(Some(&text));
     }
 
-    /// "打开"处理：dsh 已运行则直接打开；
-    /// 未运行则登记待办并立即让扫描灯流动，由守护线程拉起，就绪后自动打开。
+    /// "打开"处理：先在后台探测 dsh 端口 (避免 500ms 探测阻塞主线程)，
+    /// 同时立即登记待办并让扫描灯流动；探测到已就绪则直接打开并停止动画。
     fn handle_open(&self) {
-        if dsh::port_ready() {
-            let _ = dsh::open_page();
-        } else {
-            self.pending_open.store(true, Ordering::SeqCst);
-            self.pending_from_restart.store(false, Ordering::SeqCst);
-            set_anim(&self.anim_running, true, &self.proxy);
-            // 与动画同款即时反馈：tooltip 立即显示"启动中"
-            self.update_tooltip(false, true);
-            log::info("dsh 未运行：登记打开待办，由 watchdog 拉起后就绪自动打开");
-        }
+        log::info("用户请求打开 dsh，后台探测端口");
+        self.pending_open.store(true, Ordering::SeqCst);
+        self.pending_from_restart.store(false, Ordering::SeqCst);
+        set_anim(&self.anim_running, true, &self.proxy);
+        // 与动画同款即时反馈：tooltip 立即显示"启动中"
+        self.update_tooltip(false, true);
+
+        let proxy = self.proxy.clone();
+        thread::spawn(move || {
+            let ready = dsh::port_ready();
+            let _ = proxy.send_event(UserEvent::OpenProbeDone { ready });
+        });
     }
 
     /// 更新检测线程：启动即首查一次，之后每 1 小时复查；
-    /// 发现更新由检测线程直接发 Windows 通知 (去重后每版本仅提示一次)
+    /// 发现更新由检测线程直接通过 WinRT 发 Windows 通知 (3 天日志窗口内去重)
     fn spawn_checker(&self) {
         update::spawn_checker(self.quitting.clone());
     }
@@ -363,6 +383,18 @@ impl ApplicationHandler<UserEvent> for App {
                 // 实时读 starting：事件到达时若 flow 已结束则显示最终状态，
                 // 避免竞态 (watchdog 事件与 AnimationDone 乱序) 导致 tooltip 卡"启动中"
                 self.update_tooltip(ready, self.starting.load(Ordering::SeqCst));
+            }
+            UserEvent::OpenProbeDone { ready } => {
+                if ready {
+                    set_anim(&self.anim_running, false, &self.proxy);
+                    self.update_tooltip(true, false);
+                    self.pending_from_restart.store(false, Ordering::SeqCst);
+                    if self.pending_open.swap(false, Ordering::SeqCst) {
+                        let _ = dsh::open_page();
+                    }
+                } else {
+                    log::info("dsh 未运行：登记打开待办，由 watchdog 拉起后就绪自动打开");
+                }
             }
         }
     }

@@ -3,12 +3,12 @@
 //! 检测源策略 (用户选定)：GitHub Releases API 直连为主，失败时依次尝试
 //! gh-proxy 类镜像前缀转发同一 API。全部源失败视为网络问题，静默返回错误。
 //!
-//! 提示策略：发现更新后经 Windows 系统通知 (toast) 提示一次；
+//! 提示策略：发现更新后由 Rust 直接通过 WinRT 发送 Windows toast (不启动 PowerShell)；
 //! 去重依据为 launcher.log 中最近一条仍在 3 天保留窗口内的“更新检测成功”日志行，
 //! 同一版本在保留窗口内不重复提示，出现更新的版本后再提示。
 //!
 //! 实现要点：
-//! - WinHTTP (系统组件) 发起 HTTPS：零第三方依赖，自动走系统代理，墙内更稳
+//! - WinHTTP (系统组件) 发起 HTTPS：零第三方 HTTP 依赖，自动走系统代理，墙内更稳
 //! - 版本号 YY.MM.DD.NN 段长不固定：按 . 分段转数值逐段比较，不能字符串字典序
 //! - 响应仅提取 tag_name 字段，手工解析 JSON，不引入 serde
 
@@ -60,19 +60,25 @@ fn fetch_latest_version() -> Result<UpdateInfo, ()> {
 /// 后台检测线程：启动即首查一次，之后每 1 小时复查。
 /// 成功结果按日志日写入 launcher.log：进程启动写一次；运行跨过凌晨 4 点后写一次；
 /// 同一日志日内只有远端出现更新版本时才再写，避免每小时重复刷日志。
-/// 发现新版本且最近日志中未记录过该版本时发 Windows 通知 (toast)。
+/// 发现新版本且最近日志中未记录过该版本时直接通过 WinRT 发 toast。
+/// 发送失败会在本进程内按小时重试，成功后不再提示该版本。
 pub fn spawn_checker(quitting: Arc<AtomicBool>) {
     thread::spawn(move || {
         let mut next = Instant::now();
         let mut last_written_remote: Option<String> = None;
         let mut last_written_day: Option<LogDay> = None;
+        let mut notify_failed_version: Option<String> = None;
         loop {
             if quitting.load(Ordering::SeqCst) {
                 break;
             }
             if Instant::now() >= next {
                 next = Instant::now() + Duration::from_secs(60 * 60);
-                run_check(&mut last_written_remote, &mut last_written_day);
+                run_check(
+                    &mut last_written_remote,
+                    &mut last_written_day,
+                    &mut notify_failed_version,
+                );
             }
             thread::sleep(Duration::from_millis(1000));
         }
@@ -80,7 +86,11 @@ pub fn spawn_checker(quitting: Arc<AtomicBool>) {
 }
 
 /// 单次检测：写入节奏由上次写入版本/日志日控制；有更新且 3 天日志内未记录时通知。
-fn run_check(last_written_remote: &mut Option<String>, last_written_day: &mut Option<LogDay>) {
+fn run_check(
+    last_written_remote: &mut Option<String>,
+    last_written_day: &mut Option<LogDay>,
+    notify_failed_version: &mut Option<String>,
+) {
     match fetch_latest_version() {
         Ok(info) => {
             let local = local_version();
@@ -89,12 +99,31 @@ fn run_check(last_written_remote: &mut Option<String>, last_written_day: &mut Op
             // 会误判为“已提示过”。同时参考本进程已记录的版本，避免日志写入失败/
             // 被外部删除时同一小时内重复提示。
             if is_newer(local, &info.version) {
+                let retry_failed = notify_failed_version.as_deref() == Some(info.version.as_str());
                 let last_logged = crate::log::last_logged_update_version();
                 let last_known =
                     newest_version(last_logged.as_deref(), last_written_remote.as_deref());
-                if should_notify_version(&info.version, last_known) {
-                    notify_once(&info);
+                if retry_failed || should_notify_version(&info.version, last_known) {
+                    match crate::toast::show_update_toast(&info.version) {
+                        Ok(()) => {
+                            *notify_failed_version = None;
+                            crate::log::info(&format!(
+                                "发现新版本 v{}，已发送 Windows 通知",
+                                info.version
+                            ));
+                        }
+                        Err(e) => {
+                            *notify_failed_version = Some(info.version.clone());
+                            crate::log::error(&format!(
+                                "发送更新通知失败 (v{})：{e}，下一轮检查将重试",
+                                info.version
+                            ));
+                        }
+                    }
                 }
+            } else if notify_failed_version.as_deref() == Some(info.version.as_str()) {
+                // 远端已不再比本地新，清除遗留的失败重试状态
+                *notify_failed_version = None;
             }
 
             let today = crate::log::current_log_day();
@@ -113,22 +142,6 @@ fn run_check(last_written_remote: &mut Option<String>, last_written_day: &mut Op
             }
         }
         Err(()) => crate::log::info("更新检测失败 (网络不可达)，静默忽略"),
-    }
-}
-
-/// 去重通知：仅当远端版本比最近日志中的在线版本更新时提示一次。
-/// 在线版本日志按普通规则保留 3 天，过期后允许再次提示。
-fn notify_once(info: &UpdateInfo) {
-    crate::log::info(&format!(
-        "发现新版本 v{}，已发送 Windows 通知",
-        info.version
-    ));
-    // 图标取自当前 exe (内嵌 ICO)；路径转 file URI 供注册表 IconUri 使用
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| "DshLauncher.exe".to_string());
-    if let Err(e) = crate::dsh::run_ps(&toast_script(&info.version, &exe)) {
-        crate::log::error(&format!("发送更新通知失败：{e}"));
     }
 }
 
@@ -168,28 +181,6 @@ fn should_log_update_check(
         Some(last) => is_newer(last, remote),
         None => true,
     }
-}
-
-/// Windows toast 通知脚本 (PowerShell WinRT)：
-/// 先注册自有 AUMID (NekoPawClub.DshLauncher：显示名 DshLauncher + exe 内嵌图标)，
-/// 再用自有 AUMID 发通知——通知中心显示为 DshLauncher 而非 Windows PowerShell。
-/// 注册在 HKCU 下进行，无需管理员权限，幂等执行。
-fn toast_script(version: &str, exe_path: &str) -> String {
-    format!(
-        r#"$ErrorActionPreference = 'SilentlyContinue'
-$regPath = 'HKCU:\Software\Classes\AppUserModelId\NekoPawClub.DshLauncher'
-if (-not (Test-Path $regPath)) {{ New-Item -Path $regPath -Force | Out-Null }}
-Set-ItemProperty -Path $regPath -Name DisplayName -Value 'DshLauncher'
-Set-ItemProperty -Path $regPath -Name IconUri -Value ('file:///{exe_path}'.Replace(' ', '%20'))
-[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
-[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime] | Out-Null
-$xmlText = '<toast activationType="protocol" launch="https://github.com/NekoPawClub/DshLauncher/releases"><visual><binding template="ToastGeneric"><text>DshLauncher 新版本 v{version}</text><text>点击通知打开下载页面</text></binding></visual></toast>'
-$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
-$xml.LoadXml($xmlText)
-$toast = New-Object Windows.UI.Notifications.ToastNotification $xml
-[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('NekoPawClub.DshLauncher').Show($toast)
-"#
-    )
 }
 
 /// 候选 URL：主 API 优先；环境变量 DSHLAUNCHER_UPDATE_MIRROR 可自定义镜像前缀
@@ -328,7 +319,7 @@ fn http_get(url: &str) -> Result<String, ()> {
             WinHttpCloseHandle(session);
             return Err(());
         }
-        // 目标路径 = path + extra (?query)；所有候选均为 https
+        // 目标路径 = path + extra (?query)；根据 URL scheme 选择是否启用 TLS
         let path_len = comp.dwUrlPathLength as usize;
         let extra_len = comp.dwExtraInfoLength as usize;
         let mut object = Vec::with_capacity(path_len + extra_len + 2);
@@ -339,6 +330,11 @@ fn http_get(url: &str) -> Result<String, ()> {
         }
         object.extend_from_slice(&extra_buf[..extra_len]);
         object.push(0);
+        let secure = if url.to_ascii_lowercase().starts_with("https://") {
+            WINHTTP_FLAG_SECURE
+        } else {
+            0
+        };
         let verb = to_wide("GET");
         let request = WinHttpOpenRequest(
             connect,
@@ -347,7 +343,7 @@ fn http_get(url: &str) -> Result<String, ()> {
             std::ptr::null(),
             std::ptr::null(),
             std::ptr::null(),
-            WINHTTP_FLAG_SECURE,
+            secure,
         );
         if request.is_null() {
             WinHttpCloseHandle(connect);
@@ -417,24 +413,6 @@ mod tests {
             parse_version(local_version()).is_some(),
             "本地版本格式非法：{}",
             local_version()
-        );
-    }
-
-    #[test]
-    fn toast_script_registers_own_aumid() {
-        let s = toast_script("26.08.18.01", "C:/Users/test/DshLauncher.exe");
-        assert!(s.contains("NekoPawClub.DshLauncher"), "应注册自有 AUMID");
-        assert!(s.contains("DisplayName"), "应设置显示名");
-        assert!(s.contains("DshLauncher 新版本 v26.08.18.01"));
-        assert!(s.contains("file:///C:/Users/test/DshLauncher.exe"));
-        assert!(
-            !s.contains("WindowsPowerShell"),
-            "不应再借用 PowerShell AUMID"
-        );
-        assert!(
-            s.contains("activationType=\"protocol\"")
-                && s.contains("launch=\"https://github.com/NekoPawClub/DshLauncher/releases\""),
-            "点击通知应打开下载页面"
         );
     }
 

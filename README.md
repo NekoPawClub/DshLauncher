@@ -16,7 +16,7 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘启动器，使用 Rust 编写。
   - **重启**：仅终结 dsh，由守护线程自动保活拉起 (npx -y @deepseek-ai/dsh web)，就绪后自动打开操作页面
   - **退出**：结束 Harness 并退出本程序
 - 左键单击无功能；左键双击等同“打开”
-- 保活细节：连续拉起失败 3 次后轮询节奏自动放慢 (2 秒 → 30 秒)，避免无效高频重试；退出时终结 dsh (Job 秒杀整个进程树，外部残留兜底脚本清理)
+- 保活细节：连续拉起失败 3 次后轮询节奏自动放慢 (2 秒 → 30 秒)，避免无效高频重试；退出时终结 dsh (Job 秒杀整个进程树，外部残留由纯 Win32 API 兜底清理)
 
 ## 构建
 
@@ -32,15 +32,15 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘启动器，使用 Rust 编写。
 ## 版本与发布
 
 - exe 版本号格式 `YY.MM.DD.NN` (年.月.日.当日第几次发布，各段固定两位补零，如 26.08.05.01)：CI 发布时经环境变量 `DSHLAUNCHER_VERSION` 传入 build.rs 嵌入；本地构建自动取构建当天日期 + 0
-- 推送 main 且改动涉及编译文件时，CI 自动执行两步发布：先用上一发布版本号编译并与上一 Release 产物对比 SHA256 (一致则不发布，如仅注释改动)；有变化则按北京时间当日计数生成 `vYY.MM.DD.NN` tag 与 Release (正文为上一发布以来的提交列表)
+- 推送 main 且改动涉及编译文件时，CI 用 `git diff -b` 比较上一发布以来的源码：只有 `Cargo.toml` / `Cargo.lock` / `build.rs` / `src/` / `icons/` 出现非缩进变化才发布；源码无实质变化 (含仅缩进变化) 则跳过，发布时按北京时间当日计数生成 `vYY.MM.DD.NN` tag 与 Release (正文为上一发布以来的提交列表)
 - 纯文档改动 (README/AGENTS 等) 不触发 CI
 
 ## 更新检测
 
-- 启动即检查一次，之后每 1 小时自动复查；在线版本写入 `launcher.log`：进程启动写一次，跨凌晨 4 点日志日写一次，同一日志日仅远端出现新版本时增写；发现新版本通过 Windows 系统通知提示
+- 启动即检查一次，之后每 1 小时自动复查；在线版本写入 `launcher.log`：进程启动写一次，跨凌晨 4 点日志日写一次，同一日志日仅远端出现新版本时增写；发现新版本由 Rust 直接通过 WinRT 发送 Windows 系统通知 (不再启动 PowerShell)
 - 检测源：GitHub Releases API 直连为主，失败自动切换 gh-proxy 镜像；可用环境变量 `DSHLAUNCHER_UPDATE_MIRROR` 自定义镜像前缀
 - 同一版本在最近 3 天日志记录内只提示一次 (去重依据为 `launcher.log` 中最近 3 天内最近一次“更新检测成功”记录的在线版本；记录过期清理后允许再次提示)，出现更新的版本后再提示；点击通知直接打开下载页面
-- 通知在通知中心显示为 DshLauncher (发送前自动注册自有 AUMID，附带程序图标)
+- 通知在通知中心显示为 DshLauncher (发送前自动注册自有 AUMID，附带程序图标；发送失败会记录错误并在下一轮检查时重试)
 
 ## 端口
 
@@ -52,4 +52,4 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘启动器，使用 Rust 编写。
 - 托盘图标与可执行文件图标均来自 `icons/DeepSeekHarness-WhaleGirl.ico`
 - 图标来源：[deepseek-whale-girl-icon](https://github.com/fornarwhal/deepseek-whale-girl-icon.git)
 - 单实例：重复启动会自动退出
-- 运行日志：启动器事件与 dsh 输出统一写入 `%USERPROFILE%/.dsh/launcher.log` (单文件；启动器日志为 `[INFO]/[WARN]/[FAIL]`，dsh 的 stdout/stderr 逐行加时间标签与 `[DSH]` 标记；按每行时间标签保留最近 3 天，凌晨 4 点日界；更新检测与通知记录同样按普通日志清理；测试实例自动带后缀)；可用环境变量 `DSHLAUNCHER_LOG_DIR` 覆盖日志目录
+- 运行日志：启动器事件与 dsh 输出统一写入 `%USERPROFILE%/.dsh/launcher.log` (单文件；启动器日志为 `[INFO]/[WARN]/[FAIL]`，dsh 的 stdout/stderr 按换行/缓冲块加时间标签与 `[DSH]` 标记；按每行时间标签保留最近 3 天，凌晨 4 点日界；更新检测与通知记录同样按普通日志清理；测试实例自动带后缀)；可用环境变量 `DSHLAUNCHER_LOG_DIR` 覆盖日志目录

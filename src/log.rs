@@ -6,7 +6,7 @@
 //! dsh 子进程 (npx/node) 输出、更新检测与更新通知。
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -35,19 +35,39 @@ pub(crate) fn log_base_dir() -> PathBuf {
     }
 }
 
-/// 实例后缀 (DSHLAUNCHER_INSTANCE，测试实例隔离日志文件)，含尾部连字符
+/// 实例名 (DSHLAUNCHER_INSTANCE)：统一 trim 并只保留字母/数字/连字符/下划线，
+/// 日志文件名与单实例互斥体共用同一清洗规则，避免路径穿越与命名不一致。
+pub(crate) fn instance_id() -> String {
+    std::env::var("DSHLAUNCHER_INSTANCE")
+        .map(|s| sanitize_instance_id(&s))
+        .unwrap_or_default()
+}
+
+/// trim 并只保留字母/数字/连字符/下划线，避免路径穿越与命名不一致
+fn sanitize_instance_id(s: &str) -> String {
+    s.trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect()
+}
+
+/// 实例后缀 (测试实例隔离日志文件)，含尾部连字符；空实例名无后缀
 fn instance_suffix() -> String {
-    match std::env::var("DSHLAUNCHER_INSTANCE") {
-        Ok(s) if !s.trim().is_empty() => format!("{}-", s.trim()),
-        _ => String::new(),
+    let id = instance_id();
+    if id.is_empty() {
+        String::new()
+    } else {
+        format!("{id}-")
     }
 }
 
 /// 日志文件名：正常为 launcher.log；测试实例为 launcher-<instance>.log
 fn log_file_name() -> String {
-    match std::env::var("DSHLAUNCHER_INSTANCE") {
-        Ok(s) if !s.trim().is_empty() => format!("launcher-{s}.log"),
-        _ => "launcher.log".to_string(),
+    let id = instance_id();
+    if id.is_empty() {
+        "launcher.log".to_string()
+    } else {
+        format!("launcher-{id}.log")
     }
 }
 
@@ -202,21 +222,66 @@ fn should_keep_log_line(line: &str, cutoff: i64) -> bool {
 }
 
 /// 按行首时间标签清理单文件日志：只保留 cutoff 及之后的日志行。
-/// 读取和重写都假定调用方已持有 LOG_LOCK。
+/// 流式逐行写入临时文件后替换，避免大日志整体读入内存；
+/// 调用方已持有 LOG_LOCK，因此替换期间不会有本程序写入。
 fn prune_log_file(path: &Path, cutoff: i64) {
-    let Ok(content) = std::fs::read_to_string(path) else {
+    let Ok(input) = File::open(path) else {
         return;
     };
-    let mut kept = String::with_capacity(content.len());
-    for line in content.split_inclusive('\n') {
-        if should_keep_log_line(line, cutoff) {
-            kept.push_str(line);
+    let tmp = path.with_extension("tmp");
+    let Ok(output) = File::create(&tmp) else {
+        return;
+    };
+
+    let mut reader = BufReader::new(input);
+    let mut writer = BufWriter::new(output);
+    let mut buf = Vec::new();
+    let mut total = 0u64;
+    let mut kept = 0u64;
+    let mut failed = false;
+
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n as u64;
+                let line = String::from_utf8_lossy(&buf);
+                if should_keep_log_line(&line, cutoff) {
+                    if writer.write_all(&buf).is_err() {
+                        failed = true;
+                        break;
+                    }
+                    kept += buf.len() as u64;
+                }
+            }
+            Err(e) => {
+                eprintln!("[log] 读取日志失败 {}: {e}", path.display());
+                failed = true;
+                break;
+            }
         }
     }
-    if kept.len() != content.len() {
-        if let Err(e) = std::fs::write(path, kept.as_bytes()) {
-            eprintln!("[log] 清理日志失败 {}: {e}", path.display());
-        }
+
+    if failed || writer.flush().is_err() {
+        drop(reader);
+        drop(writer);
+        let _ = std::fs::remove_file(&tmp);
+        eprintln!("[log] 清理日志失败 {} (写入临时文件失败)", path.display());
+        return;
+    }
+
+    drop(reader);
+    drop(writer);
+
+    if kept == total {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        eprintln!("[log] 替换日志失败 {}: {e}", path.display());
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -491,5 +556,13 @@ mod tests {
             scan_last_logged_update_version(std::io::Cursor::new(expired.as_bytes()), cutoff),
             None
         );
+    }
+
+    /// 实例名清洗：trim + 只保留安全字符，避免日志文件路径穿越
+    #[test]
+    fn instance_id_sanitizes_env_value() {
+        assert_eq!(sanitize_instance_id("  test_01  "), "test_01");
+        assert_eq!(sanitize_instance_id("../evil\\path"), "evilpath");
+        assert_eq!(sanitize_instance_id("  "), "");
     }
 }

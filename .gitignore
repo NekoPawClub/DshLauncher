@@ -4,3 +4,4 @@
 # 测试产物（假 npx、临时日志等，不应入库）
 /scripts/
 .test-logs/
+.cargo/
