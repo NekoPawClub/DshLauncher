@@ -1,7 +1,8 @@
 name: CI
 
-# 仅当影响编译/测试的文件变更时触发；纯文档改动 (README/AGENTS 等) 跳过 CI
+# 编译/测试相关文件或本工作流变化时触发；纯文档变化不触发
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
@@ -9,7 +10,8 @@ on:
       - 'Cargo.lock'
       - 'build.rs'
       - 'src/**'
-      - 'icons/**'
+      - 'tests/**'
+      - 'icons/DeepSeekHarness-WhaleGirl.ico'
       - '.github/workflows/ci.yml'
   pull_request:
     branches: [main]
@@ -18,7 +20,8 @@ on:
       - 'Cargo.lock'
       - 'build.rs'
       - 'src/**'
-      - 'icons/**'
+      - 'tests/**'
+      - 'icons/DeepSeekHarness-WhaleGirl.ico'
       - '.github/workflows/ci.yml'
 
 jobs:
@@ -43,13 +46,16 @@ jobs:
 
 
   # 发布判断使用源码比对：git diff -b 忽略缩进/空白数量变化，
-  # 只有影响编译产物的文件发生实质内容变化时才发布
+  # 只统计真正参与构建的文件，并过滤纯注释行；无实质变化不发布
   release:
     needs: check
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: windows-latest
     permissions:
       contents: write
+    concurrency:
+      group: release-${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: false
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -75,7 +81,7 @@ jobs:
           "PREV_TAG=$prevTag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "HAS_PREV=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: 比对源码变化 (忽略缩进/空白数量变化)
+      - name: 比对源码变化 (忽略缩进/空白与纯注释行)
         shell: pwsh
         run: |
           if ($env:HAS_PREV -ne '1') {
@@ -84,14 +90,36 @@ jobs:
           }
           $files = @(git diff -b --name-only "$($env:PREV_TAG)..HEAD")
           if ($LASTEXITCODE -ne 0) { Write-Error "git diff 失败"; exit 1 }
-          $codeFiles = @($files | Where-Object {
-            $_ -match '^(Cargo\.toml|Cargo\.lock|build\.rs|src/|icons/)'
-          })
+          function Test-BuildSubstantiveChange {
+            param([string]$File)
+            if ($File -eq 'Cargo.lock' -or $File -eq 'icons/DeepSeekHarness-WhaleGirl.ico') {
+              return $true
+            }
+            $diffLines = @(git diff -b --unified=0 "$env:PREV_TAG..HEAD" -- $File)
+            if ($LASTEXITCODE -ne 0) { Write-Error "git diff 失败: $File"; exit 1 }
+            foreach ($raw in $diffLines) {
+              $isAdd = $raw.StartsWith('+') -and -not $raw.StartsWith('+++')
+              $isDel = $raw.StartsWith('-') -and -not $raw.StartsWith('---')
+              if (-not ($isAdd -or $isDel)) { continue }
+              $text = $raw.Substring(1).Trim()
+              if ([string]::IsNullOrEmpty($text)) { continue }
+              $isComment = if ($File -eq 'Cargo.toml') {
+                $text.StartsWith('#')
+              } else {
+                $text -match '^(//|/\*|\*/|\*[^A-Za-z0-9_]|\*$)'
+              }
+              if (-not $isComment) { return $true }
+            }
+            return $false
+          }
+          $buildPathPrefixes = @('Cargo.toml', 'Cargo.lock', 'build.rs', 'icons/DeepSeekHarness-WhaleGirl.ico')
+          $buildFiles = @($files | Where-Object { $_ -in $buildPathPrefixes -or $_ -like 'src/*' })
+          $codeFiles = @($buildFiles | Where-Object { Test-BuildSubstantiveChange -File $_ })
           if ($codeFiles.Count -gt 0) {
-            Write-Host "以下编译相关文件存在非缩进变化:"
+            Write-Host "以下构建相关文件存在实质变化:"
             $codeFiles | ForEach-Object { Write-Host "  $_" }
           } else {
-            Write-Host "编译相关源码无实质变化，跳过发布"
+            Write-Host "构建相关源码无实质变化，跳过发布"
             "SKIP_RELEASE=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
 
@@ -112,6 +140,13 @@ jobs:
           DSHLAUNCHER_VERSION: ${{ env.PUB_VER }}
         run: cargo build --release --locked
 
+      - name: 生成 SHA256 校验文件
+        if: env.SKIP_RELEASE != '1'
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 'target/release/DshLauncher.exe').Hash.ToLowerInvariant()
+          "$hash  DshLauncher.exe" | Out-File -FilePath 'target/release/DshLauncher.exe.sha256' -Encoding ascii
+
       - name: 发布 Release 并打 tag
         if: env.SKIP_RELEASE != '1'
         shell: pwsh
@@ -122,6 +157,6 @@ jobs:
             $body = git log "$($env:PREV_TAG)..HEAD" --pretty=format:"- %s"
           }
           $body | Out-File -FilePath 'release-notes.md' -Encoding utf8
-          gh release create "v$env:PUB_VER" 'target/release/DshLauncher.exe' --title "v$env:PUB_VER" --notes-file 'release-notes.md'
+          gh release create "v$env:PUB_VER" 'target/release/DshLauncher.exe' 'target/release/DshLauncher.exe.sha256' --title "v$env:PUB_VER" --notes-file 'release-notes.md'
           if ($LASTEXITCODE -ne 0) { Write-Error "发布失败"; exit 1 }
           Write-Host "已发布 v$env:PUB_VER"

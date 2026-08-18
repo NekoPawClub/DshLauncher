@@ -4,7 +4,8 @@
 //! gh-proxy 类镜像前缀转发同一 API。全部源失败视为网络问题，静默返回错误。
 //!
 //! 提示策略：发现更新后由 Rust 直接通过 WinRT 发送 Windows toast (不启动 PowerShell)；
-//! 去重依据为 launcher.log 中最近一条仍在 3 天保留窗口内的“更新检测成功”日志行，
+//! 去重依据为 launcher.log 中最近一条仍在 3 天保留窗口内的“更新通知成功”日志行，
+//! 检测成功行只用于记录检查结果。通知失败只写 FAIL 日志，不写成功记录，
 //! 同一版本在保留窗口内不重复提示，出现更新的版本后再提示。
 //!
 //! 实现要点：
@@ -19,8 +20,11 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpCrackUrl, WinHttpOpen, WinHttpOpenRequest,
-    WinHttpQueryDataAvailable, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
-    WinHttpSetTimeouts, URL_COMPONENTS, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE,
+    WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
+    WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts, URL_COMPONENTS,
+    WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2,
+    WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3, WINHTTP_OPTION_SECURE_PROTOCOLS,
+    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
 };
 
 /// 发布仓库：https://github.com/NekoPawClub/DshLauncher
@@ -85,6 +89,7 @@ pub fn spawn_checker(quitting: Arc<AtomicBool>) {
         let mut next = Instant::now();
         let mut last_written_remote: Option<String> = None;
         let mut last_written_day: Option<LogDay> = None;
+        let mut last_notified_remote: Option<String> = None;
         let mut notify_failed_version: Option<String> = None;
         loop {
             if quitting.load(Ordering::SeqCst) {
@@ -95,6 +100,7 @@ pub fn spawn_checker(quitting: Arc<AtomicBool>) {
                 run_check(
                     &mut last_written_remote,
                     &mut last_written_day,
+                    &mut last_notified_remote,
                     &mut notify_failed_version,
                 );
             }
@@ -103,32 +109,32 @@ pub fn spawn_checker(quitting: Arc<AtomicBool>) {
     });
 }
 
-/// 单次检测：写入节奏由上次写入版本/日志日控制；有更新且 3 天日志内未记录时通知。
+/// 单次检测：检测成功日志按日写入；通知成功日志单独作为跨进程去重依据。
+/// 通知失败只写 FAIL 日志，下一轮在本进程内重试；进程重启后日志中没有
+/// 该版本的通知成功记录，仍会再次尝试提示。
 fn run_check(
     last_written_remote: &mut Option<String>,
     last_written_day: &mut Option<LogDay>,
+    last_notified_remote: &mut Option<String>,
     notify_failed_version: &mut Option<String>,
 ) {
     match fetch_latest_version() {
         Ok(info) => {
             let local = local_version();
 
-            // 通知判断必须在写入当前检查结果之前：写入后日志里的最近版本就是当前版本，
-            // 会误判为“已提示过”。同时参考本进程已记录的版本，避免日志写入失败/
-            // 被外部删除时同一小时内重复提示。
             if is_newer(local, &info.version) {
                 let retry_failed = notify_failed_version.as_deref() == Some(info.version.as_str());
-                let last_logged = crate::log::last_logged_update_version();
-                let last_known =
-                    newest_version(last_logged.as_deref(), last_written_remote.as_deref());
+                let last_logged_notified = crate::log::last_logged_notify_version();
+                let last_known = newest_version(
+                    last_logged_notified.as_deref(),
+                    last_notified_remote.as_deref(),
+                );
                 if retry_failed || should_notify_version(&info.version, last_known) {
                     match crate::toast::show_update_toast(&info.version) {
                         Ok(()) => {
                             *notify_failed_version = None;
-                            crate::log::info(&format!(
-                                "发现新版本 v{}，已发送 Windows 通知",
-                                info.version
-                            ));
+                            *last_notified_remote = Some(info.version.clone());
+                            crate::log::info(&format!("更新通知成功：远端 v{}", info.version));
                         }
                         Err(e) => {
                             *notify_failed_version = Some(info.version.clone());
@@ -163,7 +169,7 @@ fn run_check(
     }
 }
 
-/// 是否需要提示：远端版本 > 最近日志中的在线版本 → 提示；否则不提示
+/// 是否需要提示：远端版本 > 最近日志中的通知成功版本 → 提示；否则不提示
 fn should_notify_version(remote: &str, last_logged: Option<&str>) -> bool {
     match last_logged {
         Some(last) => is_newer(last, remote),
@@ -171,7 +177,7 @@ fn should_notify_version(remote: &str, last_logged: Option<&str>) -> bool {
     }
 }
 
-/// 取两个候选版本中较新的一个 (用于合并日志状态与本进程内存状态)
+/// 取两个候选版本中较新的一个 (用于合并通知成功日志与本进程内存状态)
 fn newest_version<'a>(a: Option<&'a str>, b: Option<&'a str>) -> Option<&'a str> {
     match (a, b) {
         (Some(a), Some(b)) => Some(if is_newer(a, b) { b } else { a }),
@@ -315,6 +321,30 @@ fn http_get(url: &str) -> Result<String, ()> {
         if session.is_null() {
             return Err(());
         }
+        // HTTPS 请求显式限定 TLS 1.2/1.3；旧系统不支持 1.3 时回退到仅 1.2。
+        if url.to_ascii_lowercase().starts_with("https://") {
+            let mut protocols =
+                WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+            if WinHttpSetOption(
+                session,
+                WINHTTP_OPTION_SECURE_PROTOCOLS,
+                &protocols as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<u32>() as u32,
+            ) == 0
+            {
+                protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+                if WinHttpSetOption(
+                    session,
+                    WINHTTP_OPTION_SECURE_PROTOCOLS,
+                    &protocols as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of::<u32>() as u32,
+                ) == 0
+                {
+                    WinHttpCloseHandle(session);
+                    return Err(());
+                }
+            }
+        }
         // 解析 URL：预分配缓冲供 WinHttpCrackUrl 填充
         let mut scheme_buf = [0u16; 16];
         let mut host_buf = [0u16; 256];
@@ -382,6 +412,24 @@ fn http_get(url: &str) -> Result<String, ()> {
         let ok = WinHttpSendRequest(request, std::ptr::null(), 0, std::ptr::null(), 0, 0, 0) != 0
             && WinHttpReceiveResponse(request, std::ptr::null_mut()) != 0;
         if !ok {
+            WinHttpCloseHandle(request);
+            WinHttpCloseHandle(connect);
+            WinHttpCloseHandle(session);
+            return Err(());
+        }
+        // 校验 HTTP 状态码：只有 2xx 响应才读取，404/429/镜像错误页直接切换下一候选。
+        let mut status: u32 = 0;
+        let mut status_len = std::mem::size_of::<u32>() as u32;
+        if WinHttpQueryHeaders(
+            request,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            std::ptr::null(),
+            &mut status as *mut _ as *mut core::ffi::c_void,
+            &mut status_len,
+            std::ptr::null_mut(),
+        ) == 0
+            || !(200..300).contains(&status)
+        {
             WinHttpCloseHandle(request);
             WinHttpCloseHandle(connect);
             WinHttpCloseHandle(session);
@@ -459,8 +507,8 @@ mod tests {
     }
 
     #[test]
-    fn notify_dedupe_by_logged_online_version() {
-        // 首次 (日志中无在线版本记录) → 提示
+    fn notify_dedupe_by_logged_notify_version() {
+        // 首次 (日志中无通知成功版本记录) → 提示
         assert!(should_notify_version("26.08.18.01", None));
         // 同版本重复 → 不提示
         assert!(!should_notify_version("26.08.18.01", Some("26.08.18.01")));
@@ -469,7 +517,7 @@ mod tests {
         // 回退到旧版本 → 不提示
         assert!(!should_notify_version("26.08.18.01", Some("26.08.18.02")));
 
-        // 日志状态与本进程内存状态取较新者，日志写入失败时仍可抑制重复提示
+        // 通知成功日志与本进程内存状态取较新者，日志写入失败时仍可抑制重复提示
         assert_eq!(
             newest_version(None, Some("26.08.18.01")),
             Some("26.08.18.01")

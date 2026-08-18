@@ -74,7 +74,7 @@ impl Drop for StartingGuard {
 }
 
 /// 托盘图标组：默认图标 + 启动动画帧 (扫描仪灯管)
-struct Trayicons {
+struct TrayIcons {
     default: Icon,
     frames: Vec<Icon>,
 }
@@ -96,83 +96,100 @@ fn spawn_startup_flow(
     quitting: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
-        // RAII 守卫：任何退出路径 (含 panic) 都会释放 starting
+        // RAII 守卫：任何退出路径 (含 panic) 都会释放 starting。
+        // 正常结束时先显式释放，再发送 AnimationDone：
+        // 主线程处理事件时可读到实时 starting 状态，不会把旧流程误判为新流程。
         let _guard = StartingGuard(starting.clone());
-        if quitting.load(Ordering::SeqCst) {
-            return;
-        }
-        log::info("启动流程开始");
-        // tooltip 立即显示"启动中" (watchdog 的下一次状态变化可能滞后 2 秒)
-        let _ = proxy.send_event(UserEvent::TooltipUpdate { ready: false });
-
-        // 仅当端口被残留进程占用时清理 (罕见：非 Job 管理的外部进程；
-        // Job + KILL_ON_JOB_CLOSE 保证我们启动的 dsh 崩溃即释放端口，常态零清理)
-        if dsh::port_occupied() {
-            log::info("端口被外部进程占用，先执行清理");
-            dsh::stop_harness();
-            // 等待端口释放 (最多 5 秒)
-            let wf_deadline = Instant::now() + Duration::from_secs(5);
-            while dsh::port_occupied() && Instant::now() < wf_deadline {
-                thread::sleep(Duration::from_millis(200));
-            }
-        }
-        if quitting.load(Ordering::SeqCst) {
-            return;
-        }
-
-        let mut ready = dsh::port_ready();
-        let mut waited_for_port = false;
-        let mut idle_timeout = false;
-        if !ready {
-            // 当前启动流程的输出活动追踪器：pump_dsh_output 每读到数据就 touch。
-            let activity = Arc::new(dsh::OutputActivity::new());
-            match dsh::start_harness(&quitting, activity.clone()) {
-                Ok(()) => {
-                    waited_for_port = true;
-                    let started = Instant::now();
-                    let mut last_progress = started;
-                    while !ready && !quitting.load(Ordering::SeqCst) {
-                        ready = dsh::port_ready();
-                        if ready {
-                            break;
-                        }
-                        let idle = activity.elapsed();
-                        if idle >= STARTUP_IDLE_TIMEOUT {
-                            // 连续 120 秒没有新输出，视为当前拉起卡死。
-                            idle_timeout = true;
-                            log::warn("等待 dsh 端口就绪：已 120 秒无新输出，结束当前等待");
-                            break;
-                        }
-                        if last_progress.elapsed() >= STARTUP_PROGRESS_INTERVAL {
-                            let _ = proxy.send_event(UserEvent::StartupProgress {
-                                elapsed_secs: started.elapsed().as_secs(),
-                                output_active: idle <= OUTPUT_ACTIVE_WINDOW,
-                            });
-                            last_progress = Instant::now();
-                        }
-                        thread::sleep(Duration::from_millis(500));
-                    }
-                }
-                Err(e) => {
-                    log::error(&format!("启动 dsh 失败：{e}"));
-                }
-            }
-        }
-        if !ready && !quitting.load(Ordering::SeqCst) {
-            if idle_timeout {
-                // 清理当前卡住的启动树，watchdog 重试前不叠加 npx/node。
-                log::warn("等待 dsh 端口就绪结束：清理当前启动树，watchdog 将重试");
-                dsh::stop_harness();
-            } else if waited_for_port {
-                log::warn("等待 dsh 端口就绪结束，watchdog 将重试");
-            } else {
-                log::warn("dsh 启动失败，watchdog 将重试");
-            }
-        }
-
-        log::info(&format!("启动流程结束 (就绪 = {ready})"));
+        let ready = run_startup_flow(&proxy, &quitting);
+        drop(_guard);
         let _ = proxy.send_event(UserEvent::AnimationDone { ready });
     });
+}
+
+/// 启动流程主体：端口被占才清理 → 启动 → 等待就绪。返回最终是否就绪。
+/// starting 标志由 spawn_startup_flow 的 RAII 守卫管理。
+fn run_startup_flow(proxy: &EventLoopProxy<UserEvent>, quitting: &AtomicBool) -> bool {
+    if quitting.load(Ordering::SeqCst) {
+        return false;
+    }
+    log::info("启动流程开始");
+    // tooltip 立即显示"启动中" (watchdog 的下一次状态变化可能滞后 2 秒)
+    let _ = proxy.send_event(UserEvent::TooltipUpdate { ready: false });
+
+    // 仅当端口被残留进程占用时清理 (罕见：非 Job 管理的外部进程；
+    // Job + KILL_ON_JOB_CLOSE 保证我们启动的 dsh 崩溃即释放端口，常态零清理)
+    if dsh::port_occupied() {
+        log::info("端口被外部进程占用，先执行清理");
+        dsh::stop_harness();
+        // 等待端口释放 (最多 5 秒)
+        let wf_deadline = Instant::now() + Duration::from_secs(5);
+        while dsh::port_occupied() && Instant::now() < wf_deadline {
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+    if quitting.load(Ordering::SeqCst) {
+        return false;
+    }
+
+    let mut ready = dsh::port_ready();
+    let mut waited_for_port = false;
+    let mut idle_timeout = false;
+    if !ready {
+        // 当前启动流程的输出活动追踪器：pump_dsh_output 每读到数据就 touch。
+        let activity = Arc::new(dsh::OutputActivity::new());
+        match dsh::start_harness(quitting, activity.clone()) {
+            Ok(()) => {
+                waited_for_port = true;
+                let started = Instant::now();
+                let mut last_progress = started;
+                while !ready && !quitting.load(Ordering::SeqCst) {
+                    ready = dsh::port_ready();
+                    if ready {
+                        break;
+                    }
+                    let idle = activity.elapsed();
+                    if idle >= STARTUP_IDLE_TIMEOUT {
+                        // 连续 120 秒没有新输出，视为当前拉起卡死。
+                        idle_timeout = true;
+                        log::warn("等待 dsh 端口就绪：已 120 秒无新输出，结束当前等待");
+                        break;
+                    }
+                    if last_progress.elapsed() >= STARTUP_PROGRESS_INTERVAL {
+                        let _ = proxy.send_event(UserEvent::StartupProgress {
+                            elapsed_secs: started.elapsed().as_secs(),
+                            output_active: activity.has_received_output()
+                                && idle <= OUTPUT_ACTIVE_WINDOW,
+                        });
+                        last_progress = Instant::now();
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::Interrupted
+                    && quitting.load(Ordering::SeqCst) =>
+            {
+                log::info("启动流程收到退出请求，取消启动 dsh");
+            }
+            Err(e) => {
+                log::error(&format!("启动 dsh 失败：{e}"));
+            }
+        }
+    }
+    if !ready && !quitting.load(Ordering::SeqCst) {
+        if idle_timeout {
+            // 清理当前卡住的启动树，watchdog 重试前不叠加 npx/node。
+            log::warn("等待 dsh 端口就绪结束：清理当前启动树，watchdog 将重试");
+            dsh::stop_harness();
+        } else if waited_for_port {
+            log::warn("等待 dsh 端口就绪结束，watchdog 将重试");
+        } else {
+            log::warn("dsh 启动失败，watchdog 将重试");
+        }
+    }
+
+    log::info(&format!("启动流程结束 (就绪 = {ready})"));
+    ready
 }
 
 /// 应用主体：持有托盘图标与各菜单项 id
@@ -203,6 +220,20 @@ struct App {
 }
 
 impl App {
+    /// 重启菜单的启用条件：dsh 可连接、无进行中的启动流程、
+    /// 无重启待办且未在退出。其它状态一律禁用，避免在启动/停止过程中重复触发。
+    fn restart_item_available(&self) -> bool {
+        !self.quitting.load(Ordering::SeqCst)
+            && !self.starting.load(Ordering::SeqCst)
+            && !self.pending_from_restart.load(Ordering::SeqCst)
+    }
+
+    /// 按 dsh 就绪状态同步重启菜单项：就绪且满足启用条件才可点击。
+    fn sync_restart_item(&self, ready: bool) {
+        self.restart_item
+            .set_enabled(ready && self.restart_item_available());
+    }
+
     /// 动画线程：只观察 anim_running 开关。
     /// true 期间每 150ms 发一帧 AnimationTick；true→false 下降沿才发一次
     /// AnimationStop。重复置 true 不产生额外状态变化。
@@ -344,6 +375,7 @@ impl App {
         self.quitting.store(true, Ordering::SeqCst);
         // 立即隐藏托盘图标 + 关闭动画开关 (即时反馈)
         let _ = self.tray.set_visible(false);
+        self.restart_item.set_enabled(false);
         set_anim(&self.anim_running, false);
         // 提前释放单例互斥体：此时进程尚未退出，但新实例可以立即启动
         // (新实例的 watchdog 会自动接管 dsh 状态，旧进程仅剩清理收尾)
@@ -384,6 +416,10 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     });
                 } else if ev.id() == &self.restart_id {
+                    // 重启菜单只在 dsh 就绪且无启动流程时可点击；这里再做一次防御性检查。
+                    if !self.restart_item.is_enabled() {
+                        return;
+                    }
                     // 重启：立即禁用重启菜单，防止并发重复重启；动画置 true 只改开关。
                     // 终结 dsh 必须在后台线程执行，避免阻塞主线程导致动画延迟。
                     log::info("用户请求重启 dsh");
@@ -423,27 +459,28 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::AnimationDone { ready } => {
                 // 不在这里手动停动画：动画启停只由 watchdog 的“dsh 可连接”状态决定。
-                // flow 刚结束，读取实时 starting，避免旧 flow 事件覆盖新 flow 的 tooltip。
+                // flow 在发送本事件前已释放 starting；按实时状态刷新 tooltip。
                 self.update_tooltip(ready, self.starting.load(Ordering::SeqCst));
                 if ready {
-                    // dsh 已拉起：恢复重启菜单可点击，并消费待办打开页面。
-                    self.restart_item.set_enabled(true);
+                    // dsh 已拉起：清除重启待办、恢复重启菜单，并消费待办打开页面。
                     self.pending_from_restart.store(false, Ordering::SeqCst);
+                    self.sync_restart_item(true);
                     if self.pending_open.swap(false, Ordering::SeqCst) {
                         Self::open_page_async();
                     }
-                } else if self.pending_from_restart.swap(false, Ordering::SeqCst) {
-                    // 重启失败：清除待办 (避免 dsh 恢复后反复自动打开无意义页面)，保留日志。
-                    if self.pending_open.swap(false, Ordering::SeqCst) {
-                        log::warn("重启失败：已清除打开待办 (dsh 未就绪，watchdog 将保活重试)");
+                } else {
+                    self.restart_item.set_enabled(false);
+                    if self.pending_from_restart.swap(false, Ordering::SeqCst) {
+                        // 重启失败：清除待办 (避免 dsh 恢复后反复自动打开无意义页面)，保留日志。
+                        if self.pending_open.swap(false, Ordering::SeqCst) {
+                            log::warn("重启失败：已清除打开待办 (dsh 未就绪，watchdog 将保活重试)");
+                        }
                     }
                 }
                 // "打开"来源的待办在失败时保留：等下次就绪再消费，此处不处理。
             }
             UserEvent::TooltipUpdate { ready } => {
-                if ready {
-                    self.restart_item.set_enabled(true);
-                }
+                self.sync_restart_item(ready);
                 // 实时读 starting：事件到达时若 flow 已结束则显示最终状态，
                 // 避免竞态 (watchdog 事件与 AnimationDone 乱序) 导致 tooltip 卡"启动中"
                 self.update_tooltip(ready, self.starting.load(Ordering::SeqCst));
@@ -455,7 +492,7 @@ impl ApplicationHandler<UserEvent> for App {
                     if !self.pending_from_restart.load(Ordering::SeqCst) {
                         set_anim(&self.anim_running, false);
                         self.update_tooltip(true, false);
-                        self.restart_item.set_enabled(true);
+                        self.sync_restart_item(true);
                         if self.pending_open.swap(false, Ordering::SeqCst) {
                             Self::open_page_async();
                         }
@@ -479,7 +516,7 @@ impl ApplicationHandler<UserEvent> for App {
 
 /// 加载托盘图标：默认图标 (ICO 按 PNG 裁剪比例取中心 → 缩放 32x32)
 /// + 启动动画帧 (扫描仪灯管来回扫动)
-fn load_tray_icons() -> Result<Trayicons, Box<dyn Error>> {
+fn load_tray_icons() -> Result<TrayIcons, Box<dyn Error>> {
     use image::Rgba;
 
     let ico_bytes: &[u8] = include_bytes!("../icons/DeepSeekHarness-WhaleGirl.ico");
@@ -540,13 +577,33 @@ fn load_tray_icons() -> Result<Trayicons, Box<dyn Error>> {
         frames.push(Icon::from_rgba(frame.into_raw(), 32, 32)?);
     }
 
-    Ok(Trayicons { default, frames })
+    Ok(TrayIcons { default, frames })
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() {
+    // windows_subsystem 下没有控制台：panic 也写入日志，并保留默认 hook 行为。
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = format!("线程 panic：{info}");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log::error(&message);
+            log::flush();
+        }));
+        default_hook(info);
+    }));
+
+    if let Err(e) = run() {
+        // 启动失败写日志，避免错误完全不可见。
+        log::error(&format!("DshLauncher 运行失败：{e}"));
+        log::flush();
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
     // 单实例保护：已有 DshLauncher 在运行时，本实例直接退出；
     // 句柄存入 App，退出时提前释放以便新实例立即启动
-    let mutex_handle = match dsh::single_instance_guard() {
+    let mutex_handle = match dsh::single_instance_guard()? {
         Some(handle) => Some(handle),
         None => return Ok(()),
     };
@@ -555,7 +612,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let menu = Menu::new();
     let open_item = MenuItem::new("打开", true, None);
     let config_item = MenuItem::new("配置", true, None);
-    let restart_item = MenuItem::new("重启", true, None);
+    let restart_item = MenuItem::new("重启", false, None);
     let quit_item = MenuItem::new("退出", true, None);
     menu.append_items(&[&open_item, &config_item, &restart_item, &quit_item])?;
 

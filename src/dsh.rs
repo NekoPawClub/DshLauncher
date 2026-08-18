@@ -19,7 +19,8 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
 };
 use windows_sys::Win32::Networking::WinSock::AF_INET;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, Thread32First, Thread32Next,
+    PROCESSENTRY32W, TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD, THREADENTRY32,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -27,7 +28,8 @@ use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateMutexW, OpenProcess, TerminateProcess, CREATE_NO_WINDOW, IO_COUNTERS, PROCESS_TERMINATE,
+    CreateMutexW, OpenProcess, OpenThread, ResumeThread, TerminateProcess, CREATE_NO_WINDOW,
+    CREATE_SUSPENDED, IO_COUNTERS, PROCESS_TERMINATE, THREAD_SUSPEND_RESUME,
 };
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -96,18 +98,26 @@ pub fn port_occupied() -> bool {
 /// 启动流程以“最近一次输出距今多久”作为超时依据，只要还有持续输出就不判超时。
 pub struct OutputActivity {
     last: Mutex<Instant>,
+    received: AtomicBool,
 }
 
 impl OutputActivity {
     pub fn new() -> Self {
         Self {
             last: Mutex::new(Instant::now()),
+            received: AtomicBool::new(false),
         }
     }
 
     fn touch(&self) {
+        self.received.store(true, Ordering::SeqCst);
         let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
         *last = Instant::now();
+    }
+
+    /// 启动流程是否已经收到过至少一次 dsh 输出。
+    pub fn has_received_output(&self) -> bool {
+        self.received.load(Ordering::SeqCst)
     }
 
     /// 距离上次收到 dsh 输出已经过去多久。
@@ -225,42 +235,51 @@ pub fn open_config_dir() -> io::Result<()> {
 
 /// 查询占用指定 IPv4 端口的监听进程 PID (GetExtendedTcpTable，纯 Win32)。
 fn listener_pids(port: u16) -> Vec<u32> {
-    unsafe {
-        let mut size: u32 = 0;
-        let ret = GetExtendedTcpTable(
-            std::ptr::null_mut(),
-            &mut size,
-            0,
-            AF_INET as u32,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        );
-        if ret != ERROR_INSUFFICIENT_BUFFER || size == 0 {
-            return Vec::new();
-        }
-        // 用 u64 数组分配，保证缓冲区对齐满足 MIB_TCPTABLE_OWNER_PID 的要求。
-        let units = (size as usize).div_ceil(std::mem::size_of::<u64>());
-        let mut buf = vec![0u64; units];
-        let ret = GetExtendedTcpTable(
-            buf.as_mut_ptr() as *mut core::ffi::c_void,
-            &mut size,
-            0,
-            AF_INET as u32,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        );
-        if ret != ERROR_SUCCESS {
-            return Vec::new();
-        }
+    // 端口表可能在两次查询之间增长；缓冲区不足时重试，避免偶发返回空结果。
+    for _ in 0..3 {
+        unsafe {
+            let mut size: u32 = 0;
+            let ret = GetExtendedTcpTable(
+                std::ptr::null_mut(),
+                &mut size,
+                0,
+                AF_INET as u32,
+                TCP_TABLE_OWNER_PID_ALL,
+                0,
+            );
+            if ret != ERROR_INSUFFICIENT_BUFFER || size == 0 {
+                return Vec::new();
+            }
+            // 用 u64 数组分配，保证缓冲区对齐满足 MIB_TCPTABLE_OWNER_PID 的要求。
+            let units = (size as usize).div_ceil(std::mem::size_of::<u64>());
+            let mut buf = vec![0u64; units];
+            let ret = GetExtendedTcpTable(
+                buf.as_mut_ptr() as *mut core::ffi::c_void,
+                &mut size,
+                0,
+                AF_INET as u32,
+                TCP_TABLE_OWNER_PID_ALL,
+                0,
+            );
+            if ret == ERROR_INSUFFICIENT_BUFFER {
+                continue;
+            }
+            if ret != ERROR_SUCCESS {
+                return Vec::new();
+            }
 
-        let table = &*(buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID);
-        let rows = std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
-        rows.iter()
-            .filter(|row| row.dwState == MIB_TCP_STATE_LISTEN as u32)
-            .filter(|row| u16::from_be((row.dwLocalPort & 0xffff) as u16) == port)
-            .map(|row| row.dwOwningPid)
-            .collect()
+            let table = &*(buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID);
+            let rows =
+                std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
+            return rows
+                .iter()
+                .filter(|row| row.dwState == MIB_TCP_STATE_LISTEN as u32)
+                .filter(|row| u16::from_be((row.dwLocalPort & 0xffff) as u16) == port)
+                .map(|row| row.dwOwningPid)
+                .collect();
+        }
     }
+    Vec::new()
 }
 
 /// 枚举当前进程快照 (pid, parent_pid)，用于兜底清理外部进程树。
@@ -332,6 +351,66 @@ fn is_dsh_process_name(exe_name: &str) -> bool {
     matches!(exe_name, "node.exe" | "cmd.exe" | "dsh.exe" | "npx.exe")
 }
 
+/// 恢复挂起进程的主线程：通过线程快照找到该进程的线程并 ResumeThread。
+/// 用于 CREATE_SUSPENDED 启动流程，保证进程先挂入 Job 后才开始执行。
+fn resume_process_main_thread(pid: u32) -> bool {
+    for _ in 0..20 {
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if snapshot != INVALID_HANDLE_VALUE {
+                let mut entry: THREADENTRY32 = std::mem::zeroed();
+                entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+                if Thread32First(snapshot, &mut entry) != 0 {
+                    loop {
+                        if entry.th32OwnerProcessID == pid {
+                            let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
+                            if !thread.is_null() {
+                                let resumed = ResumeThread(thread) != u32::MAX;
+                                CloseHandle(thread);
+                                CloseHandle(snapshot);
+                                return resumed;
+                            }
+                        }
+                        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+                        if Thread32Next(snapshot, &mut entry) == 0 {
+                            break;
+                        }
+                    }
+                }
+                CloseHandle(snapshot);
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+/// 收集监听进程向上连续命中的 dsh 已知祖先 (典型链路 node → npx → cmd)。
+/// 只返回链上逐级父进程，不涉及祖先的其它子进程。
+fn collect_known_ancestors(pid: u32, processes: &[(u32, u32, String)]) -> Vec<u32> {
+    let mut ancestors = Vec::new();
+    let mut current = pid;
+    while let Some((_, parent, _)) = processes.iter().find(|(id, _, _)| *id == current) {
+        let Some((_, _, parent_name)) = processes.iter().find(|(id, _, _)| id == parent) else {
+            break;
+        };
+        if *parent == 0 || !is_dsh_process_name(parent_name) || ancestors.contains(parent) {
+            break;
+        }
+        ancestors.push(*parent);
+        current = *parent;
+    }
+    ancestors
+}
+
+/// 终止监听进程的 dsh 已知祖先链 (仅在监听者不是 cmd.exe 时使用，
+/// 避免误伤 cmd 监听者更上层的命令行解释器)。
+fn kill_known_ancestors(pid: u32, processes: &[(u32, u32, String)]) {
+    for ancestor in collect_known_ancestors(pid, processes) {
+        let _ = terminate_pid(ancestor);
+    }
+}
+
 /// 用 TerminateProcess 结束单个进程；跳过本进程。
 fn terminate_pid(pid: u32) -> bool {
     if pid == 0 || pid == std::process::id() {
@@ -397,13 +476,22 @@ pub fn stop_harness() {
         // 快照中查不到名称时保守清理 (权限不足时优先保证 dsh 不残留)。
         let named = process_snapshot_with_names();
         let mut roots = Vec::new();
+        let mut ancestor_roots = Vec::new();
         let mut skipped = Vec::new();
         for &pid in &pids {
             match named.iter().find(|(id, _, _)| *id == pid) {
                 Some((_, _, name)) if !is_dsh_process_name(name) => {
                     skipped.push((pid, name.clone()));
                 }
-                _ => roots.push(pid),
+                Some((_, _, name)) => {
+                    roots.push(pid);
+                    // node/npx/dsh 监听者的上层 cmd/npx 包装进程在兜底路径中一并终止；
+                    // 监听者本身是 cmd 时不向上追溯，避免误伤无关的命令行解释器。
+                    if name != "cmd.exe" {
+                        ancestor_roots.push(pid);
+                    }
+                }
+                None => roots.push(pid),
             }
         }
         if !skipped.is_empty() {
@@ -416,6 +504,9 @@ pub fn stop_harness() {
         } else {
             crate::log::info(&format!("终止占用端口的进程树，根 PID：{roots:?}"));
             kill_process_tree(&roots);
+            for pid in ancestor_roots {
+                kill_known_ancestors(pid, &named);
+            }
         }
     }
 }
@@ -465,28 +556,33 @@ fn log_dsh_bytes(bytes: &[u8]) {
     crate::log::dsh_output(&String::from_utf8_lossy(&bytes[..end]));
 }
 
-/// 把没有换行的块立即落盘，但保留末尾不完整的 UTF-8 序列；
-/// 无法继续等待的非法 UTF-8 字节则按 lossy 方式落盘，避免 pending 无限增长。
-fn flush_partial_dsh_bytes(pending: &mut Vec<u8>) {
+/// 从无换行缓冲中取出当前可落盘的部分：
+/// 完整 UTF-8 前缀直接取出；末尾不完整的多字节序列保留在 pending 中；
+/// 非法 UTF-8 字节整段取出 (lossy 落盘)，避免 pending 无限增长。
+fn take_flushable_partial_bytes(pending: &mut Vec<u8>) -> Vec<u8> {
     if pending.is_empty() {
-        return;
+        return Vec::new();
     }
     let valid_len = match std::str::from_utf8(pending) {
         Ok(_) => pending.len(),
         Err(e) => e.valid_up_to(),
     };
     if valid_len > 0 {
-        let valid: Vec<u8> = pending.drain(..valid_len).collect();
-        log_dsh_bytes(&valid);
-    }
-    if pending.is_empty() {
-        return;
+        return pending.drain(..valid_len).collect();
     }
     if let Err(e) = std::str::from_utf8(pending) {
         if e.error_len().is_some() {
-            let invalid = std::mem::take(pending);
-            log_dsh_bytes(&invalid);
+            return std::mem::take(pending);
         }
+    }
+    Vec::new()
+}
+
+/// 把没有换行的块立即落盘，但保留末尾不完整的 UTF-8 序列。
+fn flush_partial_dsh_bytes(pending: &mut Vec<u8>) {
+    let bytes = take_flushable_partial_bytes(pending);
+    if !bytes.is_empty() {
+        log_dsh_bytes(&bytes);
     }
 }
 
@@ -500,8 +596,9 @@ fn kill_child_tree(child: &mut Child) {
 /// 端口覆盖时透传 --port；-y 避免 npx 首次安装的交互确认。
 /// cmd/npx/node 的 stdout 与 stderr 由读取线程写入 launcher.log
 /// (时间标签 + [DSH] 标记)，与启动器日志合并于同一文件。
-/// spawn 后立即挂入全局 Job (KILL_ON_JOB_CLOSE)，再检查退出请求：
-/// 任何失败路径都清理整棵进程树，避免 cmd 已派生 npx/node 后留下孤儿。
+/// cmd 以 CREATE_SUSPENDED 创建：先挂入全局 Job (KILL_ON_JOB_CLOSE)，
+/// 恢复主线程后才开始执行，因此不存在 cmd 在挂接前派生 npx/node 的窗口；
+/// 挂接与恢复之间检查退出请求，失败路径清理整棵进程树。
 pub fn start_harness(quitting: &AtomicBool, activity: Arc<OutputActivity>) -> io::Result<()> {
     let home = home_dir();
     let port = web_port();
@@ -514,12 +611,11 @@ pub fn start_harness(quitting: &AtomicBool, activity: Arc<OutputActivity>) -> io
     let mut child = Command::new("cmd.exe")
         .args(["/c", web_cmd.as_str()])
         .current_dir(&home)
-        .creation_flags(CREATE_NO_WINDOW) // 不弹出任何控制台窗口
+        .creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED) // 隐藏窗口，挂接 Job 前不执行
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
 
-    // 先挂入 Job，再检查退出请求：确保任何终止动作都覆盖 npx/node 整棵树。
     let job = match job_handle() {
         Some(job) => job,
         None => {
@@ -539,6 +635,15 @@ pub fn start_harness(quitting: &AtomicBool, activity: Arc<OutputActivity>) -> io
             kill_child_tree(&mut child);
             return Err(err);
         }
+    }
+
+    if !resume_process_main_thread(child.id()) {
+        let err = io::Error::other("恢复挂起的 dsh 启动进程失败 (主线程未找到或无法恢复)");
+        crate::log::error(&format!("{err}"));
+        unsafe {
+            TerminateJobObject(job, 1);
+        }
+        return Err(err);
     }
 
     if quitting.load(Ordering::SeqCst) {
@@ -573,10 +678,11 @@ pub fn release_single_instance(handle: HANDLE) {
     }
 }
 
-/// 创建命名互斥体实现单实例；返回 None 表示已有实例在运行。
+/// 创建命名互斥体实现单实例；Ok(None) 表示已有实例在运行，
+/// Err 表示互斥体创建失败 (与已有实例区分，便于记录真实故障)。
 /// 环境变量 DSHLAUNCHER_INSTANCE 可附加互斥体后缀 (测试实例隔离用，
 /// 让测试实例与用户实例互不干扰)。
-pub fn single_instance_guard() -> Option<HANDLE> {
+pub fn single_instance_guard() -> io::Result<Option<HANDLE>> {
     // 与日志文件后缀共用同一套清洗规则，避免同名实例却写入不同日志/互斥体
     let suffix = crate::log::instance_id();
     let name_str = format!("Local\\DshLauncher.SingleInstance{suffix}");
@@ -584,13 +690,15 @@ pub fn single_instance_guard() -> Option<HANDLE> {
     unsafe {
         let handle = CreateMutexW(std::ptr::null(), 1, name.as_ptr());
         if handle.is_null() {
-            return None;
+            let err = io::Error::last_os_error();
+            crate::log::error(&format!("创建单实例互斥体失败：{err}"));
+            return Err(err);
         }
         if GetLastError() == ERROR_ALREADY_EXISTS {
             CloseHandle(handle);
-            return None;
+            return Ok(None);
         }
-        Some(handle)
+        Ok(Some(handle))
     }
 }
 
@@ -616,6 +724,74 @@ mod tests {
     #[test]
     fn to_wide_encodes_and_terminates() {
         assert_eq!(to_wide("ab中"), vec![0x61, 0x62, 0x4e2d, 0]);
+    }
+
+    #[test]
+    fn take_flushable_partial_bytes_keeps_incomplete_utf8_tail() {
+        let mut pending = b"abc\xe4\xb8".to_vec();
+        assert_eq!(take_flushable_partial_bytes(&mut pending), b"abc");
+        assert_eq!(pending, b"\xe4\xb8");
+        assert!(take_flushable_partial_bytes(&mut pending).is_empty());
+
+        let mut invalid = vec![0xff, 0xfe];
+        assert_eq!(take_flushable_partial_bytes(&mut invalid), vec![0xff, 0xfe]);
+        assert!(invalid.is_empty());
+    }
+
+    #[test]
+    fn output_activity_tracks_received_output() {
+        let activity = OutputActivity::new();
+        assert!(!activity.has_received_output());
+        activity.touch();
+        assert!(activity.has_received_output());
+        assert!(activity.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn collect_known_ancestors_stops_at_non_dsh_process() {
+        let processes = vec![
+            (10, 3, "node.exe".to_string()),
+            (3, 2, "npx.exe".to_string()),
+            (2, 1, "cmd.exe".to_string()),
+            (1, 0, "explorer.exe".to_string()),
+        ];
+        assert_eq!(collect_known_ancestors(10, &processes), vec![3, 2]);
+
+        let unrelated = vec![
+            (20, 5, "node.exe".to_string()),
+            (5, 4, "explorer.exe".to_string()),
+            (4, 0, "explorer.exe".to_string()),
+        ];
+        assert!(collect_known_ancestors(20, &unrelated).is_empty());
+    }
+
+    #[test]
+    fn resume_process_main_thread_starts_suspended_process() {
+        let mut child = Command::new("cmd.exe")
+            .args(["/c", "exit /b 0"])
+            .creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        if !resume_process_main_thread(child.id()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("挂起进程的主线程未能在预期时间内恢复");
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().ok().flatten() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("挂起进程恢复后未在 5 秒内退出");
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert!(status.success(), "cmd /c exit /b 0 应正常退出");
     }
 
     #[test]

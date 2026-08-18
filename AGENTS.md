@@ -7,13 +7,14 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 
 - 作用：常驻系统托盘，作为 dsh 的守护程序 (watchdog)，保证 dsh 持续运行
 - 启动命令：`npx -y @deepseek-ai/dsh web` (后台隐藏窗口，端口覆盖时附加 --port)
-- 技术栈：Rust 1.97 / tray-icon 0.19 / winit 0.30 / image 0.25 / windows 0.61 (WinRT toast) / windows-sys 0.59
+- 技术栈：Rust 1.97 / tray-icon 0.19 / winit 0.30 / image 0.25 (仅 ico 特性) / windows 0.61 (WinRT toast) / windows-sys 0.59
 - 目录结构：
-  - `src/main.rs`：托盘、菜单、watchdog、启动流程、动画
+  - `src/main.rs`：托盘、菜单、watchdog、启动流程、动画；启动失败与 panic 写入 launcher.log (windows_subsystem 无控制台)
   - `src/dsh.rs`：dsh 进程控制 (启动/停止/端口探测)、ShellExecuteW、纯 Win32 进程树清理、单实例
-  - `src/log.rs`：单文件日志 `launcher.log` (启动器事件 + dsh 输出 `[DSH]`，按行时间标签 + 凌晨 4 点日界，保留 3 天；写入/查询/清理全部由后台日志管理线程串行处理，其它线程只投递消息队列)
+  - `src/log.rs`：单文件日志 `launcher.log` (启动器事件 + dsh 输出 `[DSH]`，按行时间标签 + 凌晨 4 点日界，保留 3 天；超过 10 MiB 按行截断到 8 MiB 内；写入/查询/清理全部由后台日志管理线程串行处理，其它线程只投递消息队列)
   - `src/toast.rs`：直接通过 WinRT 发送更新 toast，并登记自有 AUMID (不再启动 PowerShell)
   - `build.rs`：把 icons 下的 ICO 嵌入 PE 资源 (桌面 exe 图标)
+  - `tests/doc_language.rs`：扫描文档与源码注释，禁止过程性表述与历史依据用语
   - `icons/`：DeepSeekHarness-WhaleGirl.ico (256x256，唯一图标源)
   - `Cargo.toml`：bin 名 `DshLauncher`，release 带 lto+strip
 
@@ -45,16 +46,21 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
    - “打开”菜单用后台探测 + `OpenProbeDone` 事件；`ShellExecuteW` 打开页面/配置目录也在后台线程执行。
 4. **CI 发布判定只比源码，不比二进制 hash**：
    - 使用 `git diff -b --name-only <上一发布tag>..HEAD`。
-   - 只有 `Cargo.toml` / `Cargo.lock` / `build.rs` / `src/` / `icons/` 有非缩进变化才发布。
+   - 只统计真正参与构建的文件：`Cargo.toml` / `Cargo.lock` / `build.rs` / `src/**` / `icons/DeepSeekHarness-WhaleGirl.ico`。
+   - 在 diff 基础上过滤纯注释行；注释/空白变化不发布，文档与 PNG 图片变化不发布。
    - 不要重新引入“下载上一 Release → 编译 → SHA256 对比”。
 5. **更新去重状态只存在于 launcher.log 的 3 天窗口内**：
+   - 去重依据是最近一条仍在保留窗口内的“更新通知成功”日志行；“更新检测成功”行只记录检查结果，不承担去重。
+   - 通知失败只写 FAIL 日志，不写通知成功记录，因此进程重启后同一版本仍会重试。
    - 不得重新引入 `update-notified.txt` 之类的独立状态文件。
    - 不得永久保留任何日志行绕过 3 天清理。
 6. **dsh 启动必须先挂 Job，再检查 quitting**：
-   - spawn 后若先 `child.kill()`，cmd 已派生的 npx/node 会成为孤儿。
+   - cmd 以 `CREATE_SUSPENDED` 创建，挂入全局 Job 并恢复主线程后才开始执行，因此不存在挂接前派生 npx/node 的窗口。
+   - 挂接或恢复失败时清理整棵进程树；恢复后才检查 quitting，收到退出请求用 `TerminateJobObject` 终止。
 7. **日志清理必须流式处理，且只能在日志管理线程内执行**：
    - 禁止对 `launcher.log` 使用 `read_to_string` 后整体重写。
    - 必须逐行读、写临时文件、`rename` 替换。
+   - 单文件超过 10 MiB 后按行截断到 8 MiB 以内，同样走临时文件 + `rename`，只在日志线程执行。
    - 其它线程只向日志线程消息队列投递 Write/Read/Flush，不在调用线程做文件 I/O。
 8. **dsh 输出必须保留未完成 UTF-8 尾字节**：
    - 无换行输出跨块时，不能用 `from_utf8_lossy` 直接丢弃多字节字符的剩余字节。
@@ -67,8 +73,12 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 
 ### 自动防线 (已经落地)
 - `runtime_source_has_no_shell_proxies`：扫描源码，禁止 `Command::new("powershell.exe")` / `netstat.exe` / `taskkill.exe` 与 `-EncodedCommand`。
+- `docs_and_source_have_no_process_language`：扫描 README/build.rs/src/CI/Cargo.toml，禁止过程性表述与历史依据用语 (AGENTS.md 除外)。
 - `listener_pids_finds_current_process`：真实 `TcpListener` 验证端口 → PID。
 - `kill_process_tree_terminates_child_process`：真实 spawn 子进程并终止。
+- `resume_process_main_thread_starts_suspended_process`：真实 spawn 挂起进程并恢复主线程。
+- `truncate_log_from_head_*`：验证按大小截断保留尾部完整行。
+- `take_flushable_partial_bytes_keeps_incomplete_utf8_tail`：验证 UTF-8 尾字节保留。
 - CI：`cargo fmt --check` + `cargo clippy --locked --all-targets -- -D warnings` + `cargo test --locked`。
 
 ### 修改后必检清单
@@ -85,7 +95,7 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 ## 架构 (守护模型)
 
 ### 状态标志 (Arc<AtomicBool>，防重入)
-- `starting`：是否有启动流程进行中；`swap(true)` 抢锁，流程结束由 `StartingGuard` (RAII) 自动释放
+- `starting`：是否有启动流程进行中；`swap(true)` 抢锁，流程结束由 `StartingGuard` (RAII) 释放；正常结束先释放再发 `AnimationDone`，主线程读到实时状态
 - `pending_open`：启动期间用户请求"打开页面"的待办；`AnimationDone` 就绪时消费；`pending_from_restart` 标记来源，重启失败时清除待办 (打开来源保留)
 - `quitting`：退出请求；watchdog 与启动流程各阶段检查后立即放弃
 
@@ -95,11 +105,11 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 - 启动器启动时 dsh 已在运行 (端口连通) → 直接复用，不杀不重启
 
 ### 启动流程 (spawn_startup_flow)
-- **Job Object + KILL_ON_JOB_CLOSE (核心设计)**：start_harness 把 dsh 进程树 (cmd→npx→node) 挂入全局 Job；DshLauncher 退出/崩溃/被强杀时 Job 句柄随进程关闭，Windows 自动终止 dsh —— 从设计上保证无孤儿残留，常态启动/退出**不需要清理流程**
+- **Job Object + KILL_ON_JOB_CLOSE (核心设计)**：start_harness 以 `CREATE_SUSPENDED` 创建 cmd，挂入全局 Job 后恢复主线程，dsh 进程树 (cmd→npx→node) 全程受 Job 管理；DshLauncher 退出/崩溃/被强杀时 Job 句柄随进程关闭，Windows 自动终止 dsh —— 从设计上保证无孤儿残留，常态启动/退出**不需要清理流程**
 - 启动前仅当 `port_occupied()` (bind 探测失败 = 端口被外部进程占，毫秒级) 才 `stop_harness()` (TerminateJobObject 秒杀 + GetExtendedTcpTable/Toolhelp 纯 Win32 兜底)
 - `start_harness()` (仅一次) → 轮询端口就绪 (500ms 间隔)；超时以 dsh 输出活动为心跳：连续 120 秒无任何输出才结束等待，持续有输出不判超时，期间每 5 秒通过 `StartupProgress` 事件更新 tooltip
 - 动画由独立动画线程驱动 (见"动画策略")，flow 不负责换帧，也不手动停动画
-- 结束：`starting` 自动释放 → 发 `AnimationDone { ready }` → 主线程按 `pending_open` 待办打开页面 (重启来源的待办在失败时清除)；无输出超时会先 `stop_harness()` 清理本次启动树，避免 watchdog 重试时叠加进程
+- 结束：`starting` 释放 → 发 `AnimationDone { ready }` → 主线程按 `pending_open` 待办打开页面 (重启来源的待办在失败时清除)；无输出超时会先 `stop_harness()` 清理本次启动树，避免 watchdog 重试时叠加进程
 - 停止 dsh = `TerminateJobObject` (毫秒级)；外部残留兜底用 `GetExtendedTcpTable` 找监听 PID + Toolhelp 快照递归 `TerminateProcess`，全程纯 Win32
 
 ### 事件流
@@ -109,7 +119,7 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 ### 菜单行为
 - 打开：先在后台线程探测端口 (`OpenProbeDone` 回主线程)；就绪则直接 `open_page()`，未就绪则保留 `pending_open=true` + `set_anim(true)`，由 watchdog/flow 就绪后消费待办
 - 配置：`open_config_dir()` (见下)
-- 重启：点击瞬间 **禁用重启菜单项** (dsh 重新就绪后才恢复可点击) + `set_anim(true)` (扫描灯立即流动) + `pending_open=true` + `thread::spawn(|| stop_harness())` (**必须异步**：动画换帧依赖主线程事件循环，同步执行带 sleep 的 stop 会阻塞主线程导致动画延迟出现)，watchdog 拉起，watchdog 探测到就绪后停动画，flow 就绪后打开页面
+- 重启：**仅当 dsh 可连接且无启动流程时可点击** (dsh 未运行/启动中/重启中均为禁用)；点击瞬间禁用菜单 + `set_anim(true)` (扫描灯立即流动) + `pending_open=true` + `thread::spawn(|| stop_harness())` (**必须异步**：动画换帧依赖主线程事件循环，同步执行带 sleep 的 stop 会阻塞主线程导致动画延迟出现)，watchdog 拉起，watchdog 探测到就绪后停动画，flow 就绪后恢复菜单并打开页面
 - 退出：`quitting=true` → 隐藏托盘图标 (即时反馈) → 关闭动画开关 → **提前 `CloseHandle` 释放单例互斥体** (新实例可立即启动) → `event_loop.exit()`；`stop_harness()` (Job 秒杀 + 外部残留兜底) 在 `run_app` 返回后执行，避免阻塞事件循环 (KILL_ON_JOB_CLOSE 兜底崩溃/异常退出场景)
   - 背景：若不提前释放，图标隐藏到进程退出的窗口期内新实例会被单例拒绝启动 (用户会以为程序没响应)
 - 左键单击无功能 (`with_menu_on_left_click(false)`)；左键双击等同"打开"
@@ -135,7 +145,8 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 ### windows-sys 0.59 要点
 - 项目统一用 `to_wide()` 生成带终止符的 UTF-16 `Vec<u16>`，传参用 `.as_ptr()`；`CreateMutexW` 等 Win32 API 直接接收该指针
 - `CreateMutexW` 被 `cfg(feature = "Win32_Security")` 门控；`ShellExecuteW` 需要 feature `Win32_UI_Shell`
-- Cargo.toml features：`Win32_Foundation` + `Win32_System_Threading` + `Win32_Security` + `Win32_UI_Shell` + `Win32_System_JobObjects` + `Win32_System_IO` + `Win32_System_SystemInformation` + `Win32_System_Registry` + `Win32_UI_WindowsAndMessaging` + `Win32_Networking_WinHttp`
+- Cargo.toml features：`Win32_Foundation` + `Win32_System_Threading` + `Win32_Security` + `Win32_UI_Shell` + `Win32_System_JobObjects` + `Win32_System_SystemInformation` + `Win32_System_Registry` + `Win32_UI_WindowsAndMessaging` + `Win32_NetworkManagement_IpHelper` + `Win32_System_Diagnostics_ToolHelp` + `Win32_Networking_WinSock` + `Win32_Networking_WinHttp`
+- `image` 依赖关闭默认特性，只启用 `ico` (内含 bmp/png 支持)，减小构建依赖面
 - `ShellExecuteW` 返回 HINSTANCE，`as isize > 32` 表示成功 (打开 URL 无黑框，替代 cmd start)
 
 ### 纯 Win32 兜底清理 (dsh.rs)
@@ -146,9 +157,9 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 - 端口 `DSHLAUNCHER_PORT` 环境变量可覆盖默认 3080
 
 ### dsh 启动与输出日志 (dsh.rs)
-- start_harness 直接用 `Command::new("cmd.exe")` + `creation_flags(CREATE_NO_WINDOW)` 启动 `cmd /c npx -y @deepseek-ai/dsh web`，不再经 PowerShell Start-Process 中转
-- stdout/stderr 由读取线程分块写入 `~/.dsh/launcher.log` (时间标签 + `[DSH]` 标记；按换行切行，无换行按缓冲块落盘，与启动器日志合并，随 3 天清理)：npx/node 的全部输出落盘，启动卡顿/失败从此定位 (2026-08-18 曾两次 120 秒超时但无任何线索可查)；不再使用单独的 `dsh.log` 与 1 MiB 清空逻辑
-- 进程树为 cmd→npx→node：spawn 后先挂入全局 Job 再检查 quitting；任何失败路径用 Toolhelp 快照递归清理整棵树，避免挂 Job 前派生 npx/node 成为孤儿
+- start_harness 用 `Command::new("cmd.exe")` + `creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED)` 创建 `cmd /c npx -y @deepseek-ai/dsh web`，挂入全局 Job 后用 Toolhelp 线程快照 `OpenThread + ResumeThread` 恢复主线程
+- stdout/stderr 由读取线程分块写入 `~/.dsh/launcher.log` (时间标签 + `[DSH]` 标记；按换行切行，无换行按缓冲块落盘，与启动器日志合并，随 3 天清理 + 10 MiB 大小上限)：npx/node 的全部输出落盘，启动卡顿/失败从此定位 (2026-08-18 曾两次 120 秒超时但无任何线索可查)
+- 进程树为 cmd→npx→node：cmd 挂入 Job 后才恢复执行；挂接/恢复失败用 Toolhelp 快照递归清理整棵树，避免孤儿
 
 ### 打开资源管理器配置目录
 - 直接用 `ShellExecuteW` 打开 `%USERPROFILE%/.dsh` (打开前 `create_dir_all` 确保存在)
@@ -161,21 +172,22 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 ## 版本号与 CI 发布
 
 - exe 版本号格式 `YY.MM.DD.NN` (年.月.日.当日第几次发布，各段固定两位补零，如 26.08.05.01)：CI 发布时经环境变量 `DSHLAUNCHER_VERSION` 传入 build.rs 嵌入 FILEVERSION；本地构建在 build.rs 重跑时取当天本地日期 + 0 (Cargo.toml version 不参与 exe 版本)
-- build.rs 声明 `src/`、`Cargo.toml`、`Cargo.lock`、图标与 `DSHLAUNCHER_VERSION` 为重跑输入：源码变化 → build.rs 重跑 → 取当天日期；只跨天而源码未变 → 不重跑 → 重复构建保持旧版本，符合 CI“源码无实质变化不发布”的逻辑；`/Brepro` 仅用于产物可复现性，不再作为“是否发布”的判断依据
+- build.rs 声明 `src/`、`Cargo.toml`、`Cargo.lock`、ICO 图标与 `DSHLAUNCHER_VERSION` 为重跑输入：源码变化 → build.rs 重跑 → 取当天日期；只跨天而源码未变 → 不重跑 → 重复构建保持旧版本，符合 CI“源码无实质变化不发布”的逻辑；`/Brepro` 用于产物可复现性
+- `DSHLAUNCHER_VERSION` 设置后必须是四段数值且每段 ≤ 65535，非法值直接终止构建，避免静默回退日期版本
 - CI 发布 (push 到 main 且涉及编译文件时触发，纯文档改动不触发)：
   1. 用 `git diff -b --name-only <上一发布tag>..HEAD` 获取有非缩进变化的文件
-  2. 仅当变化文件包含 `Cargo.toml` / `Cargo.lock` / `build.rs` / `src/` / `icons/` 时发布；纯缩进变化、文档变化均跳过
+  2. 只统计真正参与构建的文件 `Cargo.toml` / `Cargo.lock` / `build.rs` / `src/**` / `icons/DeepSeekHarness-WhaleGirl.ico`；Rust/TOML 的纯注释行变化过滤后不发布，PNG 与文档变化不发布
   3. 计算当日发布号 NN (北京时间，当日已发布数 + 1)，以 `vYY.MM.DD.NN` 为 tag 与标题发布 Release，正文为上一发布以来 `git log` 的提交列表
-- 发布由 `gh release create` 完成 (自动打 tag)，workflow 需要 `permissions: contents: write`
+- 发布由 `gh release create` 完成 (自动打 tag)，附带 exe 与 SHA256 校验文件；workflow 需要 `permissions: contents: write`，release job 用 concurrency 串行化同分支发布
 
 ## 更新检测
 
 - 检测源：GitHub Releases API 直连为主 (`https://api.github.com/repos/NekoPawClub/DshLauncher/releases/latest`)，失败依次尝试 gh-proxy 镜像前缀 (ghproxy.net、ghfast.top)；环境变量 `DSHLAUNCHER_UPDATE_MIRROR` 可自定义镜像前缀 (逗号分隔)，置于内置候选之前；环境变量 `DSHLAUNCHER_UPDATE_DISABLE=1/true/yes/on` 可完全禁用检测 (开发/测试用)
-- 实现：WinHTTP (windows-sys `Win32_Networking_WinHttp`)，零第三方依赖，自动走系统代理；单请求超时 解析 3s/连接 5s/发送 8s/接收 8s
+- 实现：WinHTTP (windows-sys `Win32_Networking_WinHttp`)，零第三方依赖，自动走系统代理；单请求超时 解析 3s/连接 5s/发送 8s/接收 8s；HTTPS 限定 TLS 1.2/1.3，只接受 2xx 响应
 - 版本比较：`YY.MM.DD.NN` 按 . 分段转数值逐段比较 (段长不固定，字符串字典序会误判)；本地版本由 build.rs 经 rustc-env 注入 (`env!("DSH_LAUNCHER_VERSION")`)
 - 检测节奏：启动即首查一次，之后每 1 小时复查；检测线程直接发 Windows 通知 (toast)，不占用主线程
-- 结果写日志节奏：成功的在线版本写 `更新检测成功：远端 vX (本地 vY)`；进程启动写一次，跨凌晨 4 点日志日写一次，同一日志日内仅远端出现更新版本时增写，避免每小时重复刷日志
-- 提示去重：发现更新后由 `src/toast.rs` 直接通过 WinRT 发系统通知 (点击通知用默认浏览器打开下载页面，activationType=protocol)；发送前在 HKCU 注册自有 AUMID (NekoPawClub.DshLauncher：显示名 DshLauncher + exe 内嵌图标)，通知中心显示为 DshLauncher；发送失败会记录具体错误并在本进程内按小时重试；去重依据为 launcher.log 中最近 3 天保留窗口内最后一条“更新检测成功”记录的在线版本 (更新检测/通知行都按普通日志清理，不永久保留)，同一版本在保留窗口内不重复提示，出现更新的版本后再提示；检测失败静默 (仅日志)
+- 结果写日志节奏：检测成功写 `更新检测成功：远端 vX (本地 vY)`；进程启动写一次，跨凌晨 4 点日志日写一次，同一日志日内仅远端出现更新版本时增写，避免每小时重复刷日志
+- 通知去重：发现更新后由 `src/toast.rs` 直接通过 WinRT 发系统通知 (点击通知用默认浏览器打开下载页面，activationType=protocol)；发送前在 HKCU 注册自有 AUMID (NekoPawClub.DshLauncher：显示名 DshLauncher + exe 内嵌图标)，通知中心显示为 DshLauncher；发送成功后写 `更新通知成功：远端 vX`，发送失败只写 FAIL 并在本进程内按小时重试；去重依据为 launcher.log 中最近 3 天保留窗口内最后一条“更新通知成功”记录的版本 (检测/通知行都按普通日志清理，不永久保留)，同一版本在保留窗口内不重复提示，出现更新的版本后再提示；检测失败静默 (仅日志)
 - 远端版本来自 API 响应的 tag_name 字段，手工解析 (零 serde)
 
 ## 构建
@@ -228,10 +240,10 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 
 ## 纯 Rust 化实现细节 (本次修复经验)
 
-- **CI 发布判定不要比二进制 hash，要比源码 diff**：用 `git diff -b --name-only <上一发布tag>..HEAD` 找非缩进变化文件；只有 `Cargo.toml`/`Cargo.lock`/`build.rs`/`src/`/`icons/` 中有变化才发布。工具链升级不会影响该判定。
+- **CI 发布判定不要比二进制 hash，要比源码 diff**：用 `git diff -b --name-only <上一发布tag>..HEAD` 找非缩进变化文件；只统计 `Cargo.toml`/`Cargo.lock`/`build.rs`/`src/**`/`icons/DeepSeekHarness-WhaleGirl.ico`，并过滤 Rust/TOML 纯注释行。工具链升级不会影响该判定。
 - **更新通知走 Rust/WinRT，不要经 PowerShell 代理**：`windows` crate (`Data_Xml_Dom` + `UI_Notifications`) 直接创建 `XmlDocument`/`ToastNotification`，`ToastNotificationManager::CreateToastNotifierWithId` 发送；AUMID 用 `windows-sys` 注册表 API 写 HKCU。exe 图标路径用百分号编码转 `file:///` URI。
 - **停止 dsh 的兜底也必须是纯 Win32**：`GetExtendedTcpTable` 找监听 PID，Toolhelp 快照构建进程树，先子后父 `TerminateProcess`；快照同时读取 exe 名称，只终止 `node.exe`/`cmd.exe`/`dsh.exe`/`npx.exe` 等已知 dsh 进程，避免端口误配时误杀无关服务；不要再回到 `netstat`/`taskkill`/PowerShell。
-- **Job 挂接要先于 quitting 检查**：spawn `cmd /c npx` 后若先 `child.kill()` 再挂 Job，cmd 已派生的 npx/node 会成孤儿；必须先挂 Job，失败/退出路径用整树清理。
+- **Job 挂接要先于 cmd 恢复执行与 quitting 检查**：cmd 以 `CREATE_SUSPENDED` 创建，先挂 Job 再 `ResumeThread`；任何失败路径清理整棵树，恢复后收到退出请求用 `TerminateJobObject`。
 - **主线程不要同步 `port_ready()`**：`connect_timeout` 最长 500ms 会卡动画；“打开”菜单改为后台探测 + `OpenProbeDone` 事件回主线程。
 - **start_harness 的 Err 不能吞掉**：否则启动失败会误报“无输出超时”；要区分“启动失败”和“等待就绪无输出超时”。
 - **启动超时以输出活动为心跳**：连续 120 秒无 dsh 输出才结束等待；只要有持续输出就不超时，并通过 tooltip 显示已等待时长/是否仍在输出。

@@ -1,5 +1,6 @@
 //! 极简文件日志：单文件追加写入 ~/.dsh/launcher.log (测试实例 launcher-<instance>.log)，
-//! 仅保留最近 3 天，过时日志按每行开头的时间标签清理。
+//! 保留最近 3 天，过时日志按每行开头的时间标签清理；单文件超过 10 MiB 时
+//! 按行截断到 8 MiB 以内，避免常驻 dsh 输出无限增长。
 //!
 //! 守护程序无控制台窗口，故障诊断依赖此日志。
 //! 写入、查询与清理统一由后台日志管理线程串行执行；其它线程只向消息队列投递，
@@ -8,7 +9,7 @@
 //! dsh 子进程 (npx/node) 输出、更新检测与更新通知。
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender, SyncSender};
 use std::sync::OnceLock;
@@ -20,11 +21,15 @@ use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 
 /// 日志保留天数 (含今天)
 const KEEP_DAYS: i64 = 3;
+/// 单文件大小上限：追加写后超过该值即按行截断。
+const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
+/// 按大小截断的目标上限：保留文件尾部不超过该字节数。
+const MAX_KEEP_BYTES: u64 = 8 * 1024 * 1024;
 
-/// 日志管理线程的命令队列：写日志、查询在线版本、刷新等待都由该线程串行处理。
+/// 日志管理线程的命令队列：写日志、查询最近通知版本、刷新等待都由该线程串行处理。
 enum LogCommand {
     Write { level: &'static str, msg: String },
-    ReadLastUpdateVersion { reply: SyncSender<Option<String>> },
+    ReadLastNotifiedVersion { reply: SyncSender<Option<String>> },
     Flush { reply: SyncSender<()> },
 }
 
@@ -54,8 +59,8 @@ fn log_loop(rx: mpsc::Receiver<LogCommand>) {
                 cleanup_if_day_changed(&mut last_cleanup_day);
                 append_line(level, &msg);
             }
-            LogCommand::ReadLastUpdateVersion { reply } => {
-                let _ = reply.send(read_last_logged_update_version_now());
+            LogCommand::ReadLastNotifiedVersion { reply } => {
+                let _ = reply.send(read_last_logged_notify_version_now());
             }
             LogCommand::Flush { reply } => {
                 let _ = reply.send(());
@@ -198,13 +203,13 @@ fn parse_timestamp(line: &str) -> Option<SYSTEMTIME> {
     })
 }
 
-/// 从“更新检测成功”日志行提取远端版本号与该行归属的日志日。
-/// 只识别时间标签后紧跟 [INFO] 的 launcher 日志行，避免混入的 dsh 输出误命中。
-fn parse_update_check_line(line: &str) -> Option<(String, (i64, u32, u32))> {
+/// 从“更新通知成功”日志行提取远端版本号与该行归属的日志日。
+/// 只识别时间标签后紧跟 [INFO] 的 launcher 日志行，避免混入 dsh 输出或检测行误命中。
+fn parse_update_notify_line(line: &str) -> Option<(String, (i64, u32, u32))> {
     let st = parse_timestamp(line)?;
     let message = line.get("YYYY-MM-DD HH:MM:SS".len()..)?;
     let message = message.strip_prefix(" [INFO] ")?;
-    let message = message.strip_prefix("更新检测成功：远端 v")?;
+    let message = message.strip_prefix("更新通知成功：远端 v")?;
     let version = message
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '.')
@@ -215,14 +220,14 @@ fn parse_update_check_line(line: &str) -> Option<(String, (i64, u32, u32))> {
     Some((version, log_day_of(&st)))
 }
 
-/// 读取 launcher.log 中最近一次写入的在线版本号。
+/// 读取 launcher.log 中最近一次已通知成功的远端版本号。
 /// 通过消息队列交给日志管理线程读取，避免更新检测线程与清理/追加写入并发操作文件。
-/// 只统计仍在 3 天保留窗口内的检查行；过期的检查行等同不存在，
-/// 下次检查会重新写入并允许再次提示。
-pub(crate) fn last_logged_update_version() -> Option<String> {
+/// 只统计仍在 3 天保留窗口内的通知行；过期的通知行等同不存在，
+/// 下次检查会允许再次提示。
+pub(crate) fn last_logged_notify_version() -> Option<String> {
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
     if log_tx()
-        .send(LogCommand::ReadLastUpdateVersion { reply: reply_tx })
+        .send(LogCommand::ReadLastNotifiedVersion { reply: reply_tx })
         .is_err()
     {
         return None;
@@ -234,16 +239,16 @@ pub(crate) fn last_logged_update_version() -> Option<String> {
 }
 
 /// 日志管理线程内执行的读取：同一时刻只有本线程访问日志文件。
-fn read_last_logged_update_version_now() -> Option<String> {
+fn read_last_logged_notify_version_now() -> Option<String> {
     let today = current_log_day();
     let cutoff = days_from_civil(today.0, today.1, today.2) - (KEEP_DAYS - 1);
     let file = File::open(log_path()).ok()?;
-    scan_last_logged_update_version(BufReader::new(file), cutoff)
+    scan_last_logged_notify_version(BufReader::new(file), cutoff)
 }
 
-/// 从任意 BufRead 流中扫描 3 天窗口内最后一条在线版本记录
+/// 从任意 BufRead 流中扫描 3 天窗口内最后一条通知成功版本记录
 /// (从文件读取逻辑拆出，便于测试)
-fn scan_last_logged_update_version<R: BufRead>(mut reader: R, cutoff: i64) -> Option<String> {
+fn scan_last_logged_notify_version<R: BufRead>(mut reader: R, cutoff: i64) -> Option<String> {
     let mut buf = Vec::new();
     let mut last = None;
     loop {
@@ -256,7 +261,7 @@ fn scan_last_logged_update_version<R: BufRead>(mut reader: R, cutoff: i64) -> Op
             break;
         }
         let line = String::from_utf8_lossy(&buf);
-        if let Some((version, day)) = parse_update_check_line(&line) {
+        if let Some((version, day)) = parse_update_notify_line(&line) {
             if days_from_civil(day.0, day.1, day.2) >= cutoff {
                 last = Some(version);
             }
@@ -280,7 +285,7 @@ fn should_keep_log_line(line: &str, cutoff: i64) -> bool {
 
 /// 按行首时间标签清理单文件日志：只保留 cutoff 及之后的日志行。
 /// 流式逐行写入临时文件后替换，避免大日志整体读入内存；
-/// 调用方已持有 LOG_LOCK，因此替换期间不会有本程序写入。
+/// 调用方是日志管理线程，替换期间没有本程序其它写入者。
 fn prune_log_file(path: &Path, cutoff: i64) {
     let Ok(input) = File::open(path) else {
         return;
@@ -313,7 +318,7 @@ fn prune_log_file(path: &Path, cutoff: i64) {
                 }
             }
             Err(e) => {
-                eprintln!("[log] 读取日志失败 {}: {e}", path.display());
+                log_internal_error(&format!("读取日志失败 {}: {e}", path.display()));
                 failed = true;
                 break;
             }
@@ -324,7 +329,10 @@ fn prune_log_file(path: &Path, cutoff: i64) {
         drop(reader);
         drop(writer);
         let _ = std::fs::remove_file(&tmp);
-        eprintln!("[log] 清理日志失败 {} (写入临时文件失败)", path.display());
+        log_internal_error(&format!(
+            "清理日志失败 {} (写入临时文件失败)",
+            path.display()
+        ));
         return;
     }
 
@@ -337,9 +345,67 @@ fn prune_log_file(path: &Path, cutoff: i64) {
     }
 
     if let Err(e) = std::fs::rename(&tmp, path) {
-        eprintln!("[log] 替换日志失败 {}: {e}", path.display());
+        log_internal_error(&format!("替换日志失败 {}: {e}", path.display()));
         let _ = std::fs::remove_file(&tmp);
     }
+}
+
+/// 从文件头部按行截断：先定位到 skip 字节处，再前进到下一行边界，
+/// 把剩余完整行写入临时文件并替换原文件。结果大小不超过原始长度减去 skip。
+/// 若 skip 之后直到 EOF 都没有换行，则保留从 skip 开始的尾部 (允许首行不完整)。
+fn truncate_log_from_head(path: &Path, skip: u64) -> std::io::Result<()> {
+    let mut reader = BufReader::new(File::open(path)?);
+    reader.seek(SeekFrom::Start(skip))?;
+    let tmp = path.with_extension("tmp");
+    let output = File::create(&tmp)?;
+    {
+        let mut writer = BufWriter::new(output);
+        if skip > 0 {
+            let mut first = Vec::new();
+            let n = reader.read_until(b'\n', &mut first)?;
+            if n == 0 || !first.ends_with(b"\n") {
+                reader.seek(SeekFrom::Start(skip))?;
+            }
+        }
+        std::io::copy(&mut reader, &mut writer)?;
+        writer.flush()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// 日志管理线程内执行：单文件超过 MAX_LOG_BYTES 时，把头部按行截掉，
+/// 使剩余大小不超过 MAX_KEEP_BYTES。
+fn enforce_log_size_limit(path: &Path) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.len() <= MAX_LOG_BYTES {
+        return;
+    }
+    let skip = meta.len() - MAX_KEEP_BYTES;
+    if let Err(e) = truncate_log_from_head(path, skip) {
+        let _ = std::fs::remove_file(path.with_extension("tmp"));
+        log_internal_error(&format!("按大小截断日志失败 {}: {e}", path.display()));
+    }
+}
+
+/// 日志模块自身的错误写入当前日志文件；不经过消息队列，避免在队列/线程异常时递归。
+fn log_internal_error(msg: &str) {
+    let line = format!(
+        "{} [FAIL] {}
+",
+        timestamp(),
+        msg
+    );
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path())
+    else {
+        return;
+    };
+    let _ = file.write_all(line.as_bytes());
 }
 
 /// 删除按天拆分的日志文件 (launcher-YYYY-MM-DD.log 或 launcher-test-YYYY-MM-DD.log)，
@@ -371,8 +437,10 @@ fn remove_legacy_daily_logs(base: &Path, cutoff: i64) {
         ) else {
             continue;
         };
-        if days_from_civil(y, m, d) < cutoff && std::fs::remove_file(entry.path()).is_ok() {
-            eprintln!("[log] 清理过期日志: {}", entry.path().display());
+        if days_from_civil(y, m, d) < cutoff {
+            if let Err(e) = std::fs::remove_file(entry.path()) {
+                log_internal_error(&format!("清理过期日志失败 {}: {e}", entry.path().display()));
+            }
         }
     }
 }
@@ -411,12 +479,15 @@ fn append_line(level: &str, msg: &str) {
     );
     match OpenOptions::new().create(true).append(true).open(&path) {
         Ok(mut f) => {
-            let _ = f.write_all(line.as_bytes());
+            if f.write_all(line.as_bytes()).is_err() {
+                log_internal_error(&format!("写入日志失败 {}", path.display()));
+            }
         }
         Err(e) => {
-            eprintln!("[log] 打开日志文件失败 {}: {e}", path.display());
+            log_internal_error(&format!("打开日志文件失败 {}: {e}", path.display()));
         }
     }
+    enforce_log_size_limit(path.as_path());
 }
 
 fn write(level: &'static str, msg: &str) {
@@ -539,12 +610,12 @@ mod tests {
         );
 
         // 验证异步日志队列的读取查询路径：写 -> flush -> 管理线程内流式读取
-        info("更新检测成功：远端 v26.08.18.01 (本地 v26.08.18.00)");
+        info("更新通知成功：远端 v26.08.18.01");
         flush();
         assert_eq!(
-            last_logged_update_version().as_deref(),
+            last_logged_notify_version().as_deref(),
             Some("26.08.18.01"),
-            "日志管理线程应能读取到刚写入的在线版本"
+            "日志管理线程应能读取到刚写入的通知成功版本"
         );
 
         std::env::remove_var("DSHLAUNCHER_INSTANCE");
@@ -563,7 +634,7 @@ mod tests {
         let content = concat!(
             "2026-08-13 23:59:59 [INFO] old\n",
             "2020-01-01 00:00:00 [INFO] 更新检测成功：远端 v20.01.01.01 (本地 v20.01.01.00)\n",
-            "2020-01-01 00:00:01 [INFO] 发现新版本 v20.01.01.01，已发送 Windows 通知\n",
+            "2020-01-01 00:00:01 [INFO] 更新通知成功：远端 v20.01.01.01\n",
             "2026-08-14 04:00:00 [INFO] keep-day-14\n",
             "no-timestamp [INFO] keep\n",
             "2026-08-15 03:59:59 [INFO] keep-day-15\n"
@@ -591,8 +662,8 @@ mod tests {
             "过期更新检测行应按普通日志删除，实际：{pruned}"
         );
         assert!(
-            !pruned.contains("发现新版本 v20.01.01.01"),
-            "过期更新通知行应按普通日志删除，实际：{pruned}"
+            !pruned.contains("更新通知成功：远端 v20.01.01.01"),
+            "过期通知成功行应按普通日志删除，实际：{pruned}"
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -608,46 +679,79 @@ mod tests {
         assert!(parse_timestamp("no timestamp").is_none());
     }
 
-    /// 在线版本从“更新检测成功”日志行提取，dsh 输出与旧通知行不会误命中
+    /// 通知成功版本从“更新通知成功”日志行提取；检测行与 dsh 输出不会误命中
     #[test]
-    fn parse_update_check_line_reads_remote_version() {
-        let (version, day) = parse_update_check_line(
-            "2026-08-18 03:59:59 [INFO] 更新检测成功：远端 v26.08.18.01 (本地 v26.08.18.00)",
-        )
-        .expect("应解析成功");
+    fn parse_update_notify_line_reads_remote_version() {
+        let (version, day) =
+            parse_update_notify_line("2026-08-18 03:59:59 [INFO] 更新通知成功：远端 v26.08.18.01")
+                .expect("应解析成功");
         assert_eq!(version, "26.08.18.01");
         assert_eq!(day, (2026, 8, 17), "凌晨 4 点前应归前一天");
-        assert!(parse_update_check_line(
-            "2026-08-18 10:00:00 [DSH] [INFO] 更新检测成功：远端 v26.08.18.01"
+        assert!(parse_update_notify_line(
+            "2026-08-18 10:00:00 [DSH] [INFO] 更新通知成功：远端 v26.08.18.01"
         )
         .is_none());
-        assert!(parse_update_check_line(
-            "2026-08-18 10:00:00 [INFO] 发现新版本 v26.08.18.01，已发送 Windows 通知"
+        assert!(parse_update_notify_line(
+            "2026-08-18 10:00:00 [INFO] 更新检测成功：远端 v26.08.18.01 (本地 v26.08.18.00)"
         )
         .is_none());
     }
 
-    /// 只读取 3 天窗口内的在线版本记录；过期记录视为不存在
+    /// 只读取 3 天窗口内的通知成功版本记录；过期记录视为不存在
     #[test]
-    fn scan_last_logged_update_version_respects_retention() {
+    fn scan_last_logged_notify_version_respects_retention() {
         let cutoff = days_from_civil(2026, 8, 14);
         let content = concat!(
-            "2026-08-13 23:59:59 [INFO] 更新检测成功：远端 v26.08.13.01 (本地 v26.08.12.00)\n",
-            "2026-08-14 04:00:00 [INFO] 更新检测成功：远端 v26.08.14.01 (本地 v26.08.13.00)\n",
-            "2026-08-15 03:59:59 [INFO] 更新检测成功：远端 v26.08.15.01 (本地 v26.08.14.00)\n",
+            "2026-08-13 23:59:59 [INFO] 更新通知成功：远端 v26.08.13.01\n",
+            "2026-08-14 04:00:00 [INFO] 更新通知成功：远端 v26.08.14.01\n",
+            "2026-08-15 03:59:59 [INFO] 更新通知成功：远端 v26.08.15.01\n",
         );
         assert_eq!(
-            scan_last_logged_update_version(std::io::Cursor::new(content.as_bytes()), cutoff)
+            scan_last_logged_notify_version(std::io::Cursor::new(content.as_bytes()), cutoff)
                 .as_deref(),
             Some("26.08.15.01")
         );
 
-        let expired =
-            "2026-08-13 23:59:59 [INFO] 更新检测成功：远端 v26.08.13.01 (本地 v26.08.12.00)\n";
+        let expired = "2026-08-13 23:59:59 [INFO] 更新通知成功：远端 v26.08.13.01\n";
         assert_eq!(
-            scan_last_logged_update_version(std::io::Cursor::new(expired.as_bytes()), cutoff),
+            scan_last_logged_notify_version(std::io::Cursor::new(expired.as_bytes()), cutoff),
             None
         );
+    }
+
+    /// 超过大小上限后按行截断到目标字节数以内，并保留最新完整行
+    #[test]
+    fn truncate_log_from_head_keeps_tail_within_target() {
+        let tmp = std::env::temp_dir().join("dsh-launcher-size-test");
+        let _ = std::fs::create_dir_all(&tmp);
+        let path = tmp.join("launcher-size-test.log");
+        let content = "line-01\nline-02\nline-03\nline-04\nline-05\n";
+        std::fs::write(&path, content.as_bytes()).unwrap();
+
+        truncate_log_from_head(path.as_path(), 16).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() <= content.len() - 16);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.ends_with("line-05\n"));
+        assert!(text.starts_with("line-04\n") || text.starts_with("line-03\n"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 大小截断函数在无换行的异常大行上也保持有界输出
+    #[test]
+    fn truncate_log_from_head_handles_missing_newline() {
+        let tmp = std::env::temp_dir().join("dsh-launcher-size-test");
+        let _ = std::fs::create_dir_all(&tmp);
+        let path = tmp.join("launcher-size-no-newline.log");
+        std::fs::write(&path, b"0123456789abcdef").unwrap();
+
+        truncate_log_from_head(path.as_path(), 6).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() <= 10);
+        assert_eq!(bytes, b"6789abcdef");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// 实例名清洗：trim + 只保留安全字符，避免日志文件路径穿越

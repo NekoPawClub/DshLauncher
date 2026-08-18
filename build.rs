@@ -109,10 +109,24 @@ END
 /// 符合 CI “源码无实质变化不发布”的判定逻辑。
 fn exe_version() -> (u32, u32, u32, u32) {
     if let Ok(v) = std::env::var("DSHLAUNCHER_VERSION") {
-        let parts: Vec<u32> = v.split('.').filter_map(|s| s.parse().ok()).collect();
-        if parts.len() == 4 {
-            return (parts[0], parts[1], parts[2], parts[3]);
+        let parts: Vec<&str> = v.trim().split('.').collect();
+        assert_eq!(
+            parts.len(),
+            4,
+            "DSHLAUNCHER_VERSION 必须是四段版本号 (YY.MM.DD.NN)，当前值：{v}"
+        );
+        let mut parsed = [0u32; 4];
+        for (i, part) in parts.iter().enumerate() {
+            let value = part
+                .parse::<u32>()
+                .unwrap_or_else(|_| panic!("DSHLAUNCHER_VERSION 段 {part} 不是数值，当前值：{v}"));
+            assert!(
+                value <= 65535,
+                "DSHLAUNCHER_VERSION 段 {part} 超过 PE 版本资源上限 65535，当前值：{v}"
+            );
+            parsed[i] = value;
         }
+        return (parsed[0], parsed[1], parsed[2], parsed[3]);
     }
     let (yy, mm, dd) = local_date();
     (yy, mm, dd, 0)
