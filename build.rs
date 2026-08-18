@@ -21,7 +21,7 @@ fn main() {
         .join("DeepSeekHarness-WhaleGirl.ico");
     assert!(ico_path.is_file(), "图标文件不存在：{}", ico_path.display());
     // .rc 字符串字面量中反斜杠是转义符 (如 \a、\n)，会损坏路径
-    // (CI 路径 D:/a/DshLauncher/... 曾触发 RC2135)；统一转正斜杠
+    // CI 路径统一使用正斜杠，避免 rc.exe 把反斜杠当作转义符导致 RC2135
     let ico_rc = ico_path.to_string_lossy().replace('\\', "/");
 
     // exe 版本四段 (YY.MM.DD.NN)：CI 发布时由环境变量 DSHLAUNCHER_VERSION 传入
@@ -102,7 +102,7 @@ END
 }
 
 /// exe 版本四段 (YY.MM.DD.NN)：CI 发布时由环境变量 DSHLAUNCHER_VERSION 传入
-/// (如 26.8.18.1)；本地构建回退为 build.rs 本次执行时的本地日期 + 0。
+/// (如 26.8.18.1)；本地构建回退为 build.rs 执行时的本地日期 + 0。
 ///
 /// 版本只在 build.rs 重新执行时才会取新日期；build.rs 仅声明源码/图标/版本环境
 /// 为输入，不会因“只跨天”而重跑，因此源码未变的重复构建会维持旧版本，

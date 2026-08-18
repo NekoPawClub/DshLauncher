@@ -214,8 +214,7 @@ pub fn open_page() -> io::Result<()> {
 }
 
 /// 用资源管理器打开 dsh 配置目录 (~/.dsh)。
-/// 先确保目录存在，再通过 ShellExecuteW 直接让系统资源管理器打开；
-/// 不再依赖隐藏 PowerShell 进程里的 Shell.Application COM 枚举 (该方案在部分环境不弹窗)。
+/// 先确保目录存在，再通过 ShellExecuteW 直接让系统资源管理器打开。
 pub fn open_config_dir() -> io::Result<()> {
     let dir = Path::new(&home_dir()).join(".dsh");
     // 目录不存在时先创建，避免 ShellExecuteW 打开不存在的路径而失败
@@ -422,8 +421,7 @@ pub fn stop_harness() {
 }
 
 /// 把 dsh 子进程的 stdout/stderr 写入 launcher.log。
-/// 子进程输出由日志模块统一加时间标签与 [DSH] 标记，因此也会参与 3 天清理，
-/// 不再需要单独的 dsh.log 与 1 MiB 清空逻辑。
+/// 子进程输出由日志模块统一加时间标签与 [DSH] 标记，并参与 3 天清理。
 /// 按读取块切分：遇到换行按行写入；没有换行也随块落盘，
 /// 同时保留未完成的 UTF-8 尾字节，避免多字节字符被块边界截断。
 fn pump_dsh_output<R: Read + Send + 'static>(mut reader: R, activity: Arc<OutputActivity>) {
@@ -501,7 +499,7 @@ fn kill_child_tree(child: &mut Child) {
 /// 后台隐藏窗口启动 dsh：npx @deepseek-ai/dsh web (工作目录为用户主目录)。
 /// 端口覆盖时透传 --port；-y 避免 npx 首次安装的交互确认。
 /// cmd/npx/node 的 stdout 与 stderr 由读取线程写入 launcher.log
-/// (时间标签 + [DSH] 标记)，与启动器日志合并，不再使用单独的 dsh.log。
+/// (时间标签 + [DSH] 标记)，与启动器日志合并于同一文件。
 /// spawn 后立即挂入全局 Job (KILL_ON_JOB_CLOSE)，再检查退出请求：
 /// 任何失败路径都清理整棵进程树，避免 cmd 已派生 npx/node 后留下孤儿。
 pub fn start_harness(quitting: &AtomicBool, activity: Arc<OutputActivity>) -> io::Result<()> {

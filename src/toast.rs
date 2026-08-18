@@ -2,7 +2,7 @@
 //!
 //! 发送前用 windows-sys 在 HKCU 登记自有 AUMID
 //! (NekoPawClub.DshLauncher：显示名 DshLauncher + exe 内嵌图标)，
-//! 通知中心因此显示为 DshLauncher。整个过程不再启动 PowerShell 子进程。
+//! 通知中心因此显示为 DshLauncher。通知由 WinRT 直接发送，不创建子进程代理。
 
 use std::io;
 

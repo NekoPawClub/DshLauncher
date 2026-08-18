@@ -45,7 +45,7 @@ enum UserEvent {
     TooltipUpdate {
         ready: bool,
     },
-    /// 后台端口探测完成：“打开”菜单不再阻塞主线程等待探测结果
+    /// 后台端口探测完成：探测在后台线程执行，主线程不等待探测结果
     OpenProbeDone {
         ready: bool,
     },
@@ -87,7 +87,7 @@ const STARTUP_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const OUTPUT_ACTIVE_WINDOW: Duration = Duration::from_secs(5);
 
 /// 启动流程线程：端口被占才清理 (Job 设计保证常态无残留) → 启动 → 等待就绪。
-/// 等待不再使用硬性 120 秒上限：以 dsh 输出活动为心跳，持续有输出就不超时；
+/// 等待以 dsh 输出活动为心跳：连续 120 秒无输出才结束，持续有输出不超时；
 /// 期间通过 StartupProgress 事件更新 tooltip，让用户知道等待仍在进行。
 /// 动画由独立动画线程按 anim_running 开关驱动，本线程不操作动画。
 fn spawn_startup_flow(
@@ -124,7 +124,7 @@ fn spawn_startup_flow(
         let mut waited_for_port = false;
         let mut idle_timeout = false;
         if !ready {
-            // 本次启动的输出活动追踪器：pump_dsh_output 每读到数据就 touch。
+            // 当前启动流程的输出活动追踪器：pump_dsh_output 每读到数据就 touch。
             let activity = Arc::new(dsh::OutputActivity::new());
             match dsh::start_harness(&quitting, activity.clone()) {
                 Ok(()) => {
@@ -138,9 +138,9 @@ fn spawn_startup_flow(
                         }
                         let idle = activity.elapsed();
                         if idle >= STARTUP_IDLE_TIMEOUT {
-                            // 已连续 120 秒没有新输出，才认为本次拉起可能卡死。
+                            // 连续 120 秒没有新输出，视为当前拉起卡死。
                             idle_timeout = true;
-                            log::warn("等待 dsh 端口就绪：已 120 秒无新输出，结束本次等待");
+                            log::warn("等待 dsh 端口就绪：已 120 秒无新输出，结束当前等待");
                             break;
                         }
                         if last_progress.elapsed() >= STARTUP_PROGRESS_INTERVAL {
@@ -160,8 +160,8 @@ fn spawn_startup_flow(
         }
         if !ready && !quitting.load(Ordering::SeqCst) {
             if idle_timeout {
-                // 清理本次卡住的启动树，避免 watchdog 重试时叠加多个 npx/node。
-                log::warn("等待 dsh 端口就绪结束：清理本次启动树，watchdog 将重试");
+                // 清理当前卡住的启动树，watchdog 重试前不叠加 npx/node。
+                log::warn("等待 dsh 端口就绪结束：清理当前启动树，watchdog 将重试");
                 dsh::stop_harness();
             } else if waited_for_port {
                 log::warn("等待 dsh 端口就绪结束，watchdog 将重试");

@@ -44,8 +44,8 @@ fn log_tx() -> Sender<LogCommand> {
         .clone()
 }
 
-/// 日志管理线程：串行执行清理与追加写入；查询在写入之间完成，
-/// 因此不再需要跨线程文件锁。
+/// 日志管理线程：串行执行清理与追加写入；查询在写入之间完成。
+/// 同一时刻只有该线程访问日志文件。
 fn log_loop(rx: mpsc::Receiver<LogCommand>) {
     let mut last_cleanup_day: Option<(i64, u32, u32)> = None;
     while let Ok(cmd) = rx.recv() {
@@ -342,7 +342,7 @@ fn prune_log_file(path: &Path, cutoff: i64) {
     }
 }
 
-/// 删除旧版按天拆分遗留的日志文件 (launcher-YYYY-MM-DD.log 或 launcher-test-YYYY-MM-DD.log)，
+/// 删除按天拆分的日志文件 (launcher-YYYY-MM-DD.log 或 launcher-test-YYYY-MM-DD.log)，
 /// 仍按文件名中的日期判断是否过期。
 fn remove_legacy_daily_logs(base: &Path, cutoff: i64) {
     let prefix = format!("launcher-{}", instance_suffix());
@@ -377,7 +377,7 @@ fn remove_legacy_daily_logs(base: &Path, cutoff: i64) {
     }
 }
 
-/// 跨凌晨 4 点日志日后执行一次清理：旧版按天日志文件删除 + launcher.log 流式裁剪。
+/// 跨凌晨 4 点日志日后执行一次清理：删除按天日志文件并流式裁剪 launcher.log。
 /// 只在日志管理线程内调用，清理期间该线程停止消费队列，但主线程与 dsh 读取线程不受阻塞。
 fn cleanup_if_day_changed(last_cleanup_day: &mut Option<(i64, u32, u32)>) {
     let today = current_log_day();
@@ -427,7 +427,7 @@ fn write(level: &'static str, msg: &str) {
     });
 }
 
-/// 等待日志管理线程处理完此前投递的全部消息。
+/// 等待日志管理线程处理完已投递的全部消息。
 /// 供测试与正常退出收尾使用 (进程被强杀时仍允许丢失最后少量日志)。
 pub fn flush() {
     let Some(tx) = LOG_TX.get() else {

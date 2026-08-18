@@ -42,7 +42,7 @@ jobs:
         run: cargo test --locked
 
 
-  # 发布判断改为源码比对：git diff -b 忽略缩进/空白数量变化，
+  # 发布判断使用源码比对：git diff -b 忽略缩进/空白数量变化，
   # 只有影响编译产物的文件发生实质内容变化时才发布
   release:
     needs: check

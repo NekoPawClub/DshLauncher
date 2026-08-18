@@ -75,7 +75,7 @@ fn update_check_disabled() -> bool {
 /// 成功结果按日志日写入 launcher.log：进程启动写一次；运行跨过凌晨 4 点后写一次；
 /// 同一日志日内只有远端出现更新版本时才再写，避免每小时重复刷日志。
 /// 发现新版本且最近日志中未记录过该版本时直接通过 WinRT 发 toast。
-/// 发送失败会在本进程内按小时重试，成功后不再提示该版本。
+/// 发送失败后由下一轮检查重试；发送成功后同一版本在保留窗口内不重复提示。
 pub fn spawn_checker(quitting: Arc<AtomicBool>) {
     if update_check_disabled() {
         crate::log::info("更新检测已禁用 (DSHLAUNCHER_UPDATE_DISABLE)");
@@ -113,7 +113,7 @@ fn run_check(
         Ok(info) => {
             let local = local_version();
 
-            // 通知判断必须在写入本次检查结果之前：写入后日志里的最近版本就是当前版本，
+            // 通知判断必须在写入当前检查结果之前：写入后日志里的最近版本就是当前版本，
             // 会误判为“已提示过”。同时参考本进程已记录的版本，避免日志写入失败/
             // 被外部删除时同一小时内重复提示。
             if is_newer(local, &info.version) {
@@ -140,7 +140,7 @@ fn run_check(
                     }
                 }
             } else if notify_failed_version.as_deref() == Some(info.version.as_str()) {
-                // 远端已不再比本地新，清除遗留的失败重试状态
+                // 远端版本不高于本地时，清除遗留的失败重试状态
                 *notify_failed_version = None;
             }
 
@@ -181,7 +181,7 @@ fn newest_version<'a>(a: Option<&'a str>, b: Option<&'a str>) -> Option<&'a str>
     }
 }
 
-/// 是否需要把本次在线版本写入日志：
+/// 是否需要把当前在线版本写入日志：
 /// - 本进程首次检查 → 写 (对应“程序启动写一次”)
 /// - 已跨日志日 (凌晨 4 点日界) → 写 (对应“每天重新写一次”)
 /// - 同一日志日内远端出现更新版本 → 写 (对应“有新版本才写”)
@@ -462,7 +462,7 @@ mod tests {
     fn notify_dedupe_by_logged_online_version() {
         // 首次 (日志中无在线版本记录) → 提示
         assert!(should_notify_version("26.08.18.01", None));
-        // 同版本重复 → 不再提示
+        // 同版本重复 → 不提示
         assert!(!should_notify_version("26.08.18.01", Some("26.08.18.01")));
         // 出现更新的版本 → 再提示
         assert!(should_notify_version("26.08.18.02", Some("26.08.18.01")));

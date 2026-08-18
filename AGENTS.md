@@ -60,6 +60,10 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
    - 无换行输出跨块时，不能用 `from_utf8_lossy` 直接丢弃多字节字符的剩余字节。
 9. **任何实现变化必须同步修改 AGENTS.md / README.md**：
    - 文档还写着旧实现 (如 PowerShell、状态文件、hash 发布) 视为未完成。
+10. **更新日志、注释与文档只描述当前状态**：
+   - 提交信息、`src/` 注释、`build.rs` 注释、README.md、CI 注释不得写过程描述或历史依据，例如“不再/曾/此前/原先/改为/移除/新增/修复/本次/已实测”。
+   - 不得写无出处的笼统说法，例如“并按审查意见加固”。
+   - AGENTS.md 是项目规范与踩坑记录的锚点，是唯一允许保留上述过程性内容、历史约束与经验记录的文件。
 
 ### 自动防线 (已经落地)
 - `runtime_source_has_no_shell_proxies`：扫描源码，禁止 `Command::new("powershell.exe")` / `netstat.exe` / `taskkill.exe` 与 `-EncodedCommand`。
@@ -69,6 +73,8 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 
 ### 修改后必检清单
 - [ ] `grep -R "powershell.exe\|EncodedCommand\|netstat.exe\|taskkill.exe" src Cargo.toml build.rs` 无运行时调用 (历史注释除外)。
+- [ ] `grep -R -n -E '不再|曾|此前|原先|改为|移除|新增|修复|经验|本次|已实测|按审查' src build.rs README.md Cargo.toml .github/workflows/ci.yml` 无命中 (AGENTS.md 除外)。
+- [ ] 提交信息只描述当前状态，不写过程描述与无出处说法。
 - [ ] `cargo fmt --check`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked`、`cargo build --locked` 全部通过。
 - [ ] 没有在主线程新增 `port_ready()` / sleep / 网络 / 进程管理调用。
 - [ ] Job 挂接先于 quitting 检查；失败路径清理整棵进程树。
