@@ -21,7 +21,7 @@ fn main() {
         .join("DeepSeekHarness-WhaleGirl.ico");
     assert!(ico_path.is_file(), "图标文件不存在：{}", ico_path.display());
     // .rc 字符串字面量中反斜杠是转义符 (如 \a、\n)，会损坏路径
-    // (CI 路径 D:\a\DshLauncher\... 曾触发 RC2135)；统一转正斜杠
+    // (CI 路径 D:/a/DshLauncher/... 曾触发 RC2135)；统一转正斜杠
     let ico_rc = ico_path.to_string_lossy().replace('\\', "/");
 
     // exe 版本四段 (YY.MM.DD.NN)：CI 发布时由环境变量 DSHLAUNCHER_VERSION 传入
@@ -89,17 +89,24 @@ END
     println!("cargo:rustc-env=DSH_LAUNCHER_VERSION={v1:02}.{v2:02}.{v3:02}.{v4:02}");
     // 将生成的 .res 交给链接器
     println!("cargo:rustc-link-arg={}", res_file.display());
-    // 可重现构建：PE 时间戳归零，同源码产物 hash 稳定 (CI 靠 hash 判断是否需要发布)
+    // 可重现构建：PE 时间戳归零，同源码产物 hash 稳定；
+    // 发布判定由 CI 的源码 diff 完成，不依赖产物 hash。
     println!("cargo:rustc-link-arg=/Brepro");
     println!("cargo:rerun-if-changed=icons/DeepSeekHarness-WhaleGirl.ico");
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=Cargo.lock");
     println!("cargo:rerun-if-env-changed=RC_EXE");
     // 版本号变化必须触发重链接，保证产物内嵌版本准确
     println!("cargo:rerun-if-env-changed=DSHLAUNCHER_VERSION");
 }
 
-/// exe 版本四段 (YY.MM.DD.NN)：优先环境变量 DSHLAUNCHER_VERSION
-/// (CI 发布时传入，如 26.8.18.1)；本地构建回退为构建当天的本地日期 + 0，
-/// 版本自动跟随日期，无需手工更新
+/// exe 版本四段 (YY.MM.DD.NN)：CI 发布时由环境变量 DSHLAUNCHER_VERSION 传入
+/// (如 26.8.18.1)；本地构建回退为 build.rs 本次执行时的本地日期 + 0。
+///
+/// 版本只在 build.rs 重新执行时才会取新日期；build.rs 仅声明源码/图标/版本环境
+/// 为输入，不会因“只跨天”而重跑，因此源码未变的重复构建会维持旧版本，
+/// 符合 CI “源码无实质变化不发布”的判定逻辑。
 fn exe_version() -> (u32, u32, u32, u32) {
     if let Ok(v) = std::env::var("DSHLAUNCHER_VERSION") {
         let parts: Vec<u32> = v.split('.').filter_map(|s| s.parse().ok()).collect();
@@ -112,7 +119,7 @@ fn exe_version() -> (u32, u32, u32, u32) {
 }
 
 /// 当前本地日期 (YY, MM, DD)：kernel32!GetLocalTime，不引入第三方日期依赖。
-/// 仅用于本地构建回退；CI 发布由 DSHLAUNCHER_VERSION 提供版本，不受影响。
+/// 仅在 build.rs 被 Cargo 判定需要重跑时调用；跨天但源码未变不会调用。
 fn local_date() -> (u32, u32, u32) {
     #[repr(C)]
     struct SystemTimeLocal {
@@ -189,19 +196,70 @@ fn find_rc_exe() -> Option<PathBuf> {
         }
     }
 
-    // 4) VS 安装目录下递归查找 (兜底)，收集全部候选后优先主机架构
-    let mut candidates = Vec::new();
+    // 4) VS 安装目录：按标准固定相对布局精确匹配，不做全盘递归。
+    // VS 的相对路径是安装器固定的，用户不会修改：
+    // <VS root>/<year>/<edition>/VC/Tools/MSVC/<toolset>/bin/Host<host>/<target>/rc.exe
+    find_vs_rc_exe()
+}
+
+/// 按 VS 标准安装布局收集 rc.exe：
+/// 仅枚举两个可变层级 (edition 与 MSVC 工具集版本)，其余路径字段固定拼接。
+/// 同一工具集内优先 Host<主机架构>/<主机架构>，其次主机架构下的其它 target，
+/// 最后其它 host；跨工具集版本优先取新版本。
+fn find_vs_rc_exe() -> Option<PathBuf> {
+    let archs = preferred_archs();
+    let mut candidates: Vec<(usize, usize, Vec<u32>, PathBuf)> = Vec::new();
     for vs_root in [
         r"C:\Program Files\Microsoft Visual Studio",
         r"C:\Program Files (x86)\Microsoft Visual Studio",
     ] {
-        if let Ok(entries) = std::fs::read_dir(vs_root) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                find_rc_files_recursive(&entry.path(), 5, &mut candidates);
+        let Ok(years) = std::fs::read_dir(vs_root) else {
+            continue;
+        };
+        for year in years.filter_map(|e| e.ok()) {
+            let Ok(editions) = std::fs::read_dir(year.path()) else {
+                continue;
+            };
+            for edition in editions.filter_map(|e| e.ok()) {
+                let msvc = edition.path().join("VC").join("Tools").join("MSVC");
+                let Ok(entries) = std::fs::read_dir(&msvc) else {
+                    continue;
+                };
+                let mut versions: Vec<PathBuf> = entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_dir())
+                    .map(|e| e.path())
+                    .collect();
+                versions.sort_by_key(|p| {
+                    version_key(p.file_name().and_then(|n| n.to_str()).unwrap_or(""))
+                });
+                for version in versions.iter().rev() {
+                    for (host_rank, host) in archs.iter().enumerate() {
+                        for (target_rank, target) in archs.iter().enumerate() {
+                            let p = version
+                                .join("bin")
+                                .join(format!("Host{host}"))
+                                .join(target)
+                                .join("rc.exe");
+                            if p.is_file() {
+                                candidates.push((
+                                    host_rank,
+                                    target_rank,
+                                    version_key(
+                                        version.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+                                    ),
+                                    p,
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
-    pick_preferred_rc(&candidates)
+
+    candidates.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)).then_with(|| b.2.cmp(&a.2)));
+    candidates.into_iter().next().map(|c| c.3)
 }
 
 /// 版本字符串 → 数值序列 ("10.0.22621.0" → [10, 0, 22621, 0])，用于正确选取最新 SDK
@@ -229,40 +287,4 @@ fn preferred_archs() -> Vec<&'static str> {
         }
     }
     archs
-}
-
-/// 从路径中识别 rc.exe 所属架构。
-fn path_arch_hint(path: &Path) -> Option<&'static str> {
-    let lower = path.to_string_lossy().to_lowercase();
-    ["x64", "arm64", "x86"]
-        .into_iter()
-        .find(|arch| lower.contains(arch))
-}
-
-/// 在候选 rc.exe 中选择主机架构匹配项；匹配不到则退回第一个。
-fn pick_preferred_rc(candidates: &[PathBuf]) -> Option<PathBuf> {
-    for arch in preferred_archs() {
-        if let Some(path) = candidates.iter().find(|p| path_arch_hint(p) == Some(arch)) {
-            return Some(path.clone());
-        }
-    }
-    candidates.first().cloned()
-}
-
-/// 在目录树下有限深度内收集指定文件名的路径
-fn find_rc_files_recursive(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-    if depth == 0 {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.is_dir() {
-            find_rc_files_recursive(&path, depth - 1, out);
-        } else if path.file_name().is_some_and(|n| n == "rc.exe") {
-            out.push(path);
-        }
-    }
 }

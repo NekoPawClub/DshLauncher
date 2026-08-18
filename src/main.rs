@@ -35,7 +35,7 @@ enum UserEvent {
     Tray(TrayIconEvent),
     /// 动画换帧 (动画线程按 anim_running 驱动)
     AnimationTick,
-    /// 动画停止：恢复默认图标
+    /// 动画开关由 true 变为 false：恢复默认图标 (若期间又被置 true 则忽略)
     AnimationStop,
     /// 启动流程结束：就绪且有待办时打开页面
     AnimationDone {
@@ -49,16 +49,18 @@ enum UserEvent {
     OpenProbeDone {
         ready: bool,
     },
+    /// 启动等待进度：只要 dsh 持续输出，就不判定为超时，并通过 tooltip 告知用户
+    StartupProgress {
+        elapsed_secs: u64,
+        output_active: bool,
+    },
 }
 
-/// 切换动画状态：running=true 启动 (扫描灯流动)，false 停止 (恢复默认图标)。
-/// 供 watchdog / 启动流程 / 菜单等任意线程调用。
-fn set_anim(anim_running: &AtomicBool, running: bool, proxy: &EventLoopProxy<UserEvent>) {
-    if running {
-        anim_running.store(true, Ordering::SeqCst);
-    } else if anim_running.swap(false, Ordering::SeqCst) {
-        let _ = proxy.send_event(UserEvent::AnimationStop);
-    }
+/// 动画唯一状态开关：只修改 AtomicBool，不直接向主线程发帧/停止事件。
+/// 重复置 true 只刷新标志，不改变当前动画运行状态；置 false 后由动画线程
+/// 观察到下降沿时统一发送 AnimationStop。
+fn set_anim(anim_running: &AtomicBool, running: bool) {
+    anim_running.store(running, Ordering::SeqCst);
 }
 
 /// RAII 守卫：离开作用域 (含 panic 与提前 return) 时释放 starting 标志，
@@ -77,14 +79,21 @@ struct Trayicons {
     frames: Vec<Icon>,
 }
 
+/// 启动等待的最大无输出时长：只要 dsh 还在持续输出信息，就不按固定时长判超时。
+const STARTUP_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// 启动进度 tooltip 的更新间隔。
+const STARTUP_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+/// 多久内有输出视为“仍在持续输出”。
+const OUTPUT_ACTIVE_WINDOW: Duration = Duration::from_secs(5);
+
 /// 启动流程线程：端口被占才清理 (Job 设计保证常态无残留) → 启动 → 等待就绪。
-/// 动画由独立动画线程驱动 (探测到未运行即已流动)，本线程只负责流程；
-/// 各阶段都会检查退出请求 (quitting)，退出时立即放弃。
+/// 等待不再使用硬性 120 秒上限：以 dsh 输出活动为心跳，持续有输出就不超时；
+/// 期间通过 StartupProgress 事件更新 tooltip，让用户知道等待仍在进行。
+/// 动画由独立动画线程按 anim_running 开关驱动，本线程不操作动画。
 fn spawn_startup_flow(
     proxy: EventLoopProxy<UserEvent>,
     starting: Arc<AtomicBool>,
     quitting: Arc<AtomicBool>,
-    anim_running: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
         // RAII 守卫：任何退出路径 (含 panic) 都会释放 starting
@@ -113,16 +122,33 @@ fn spawn_startup_flow(
 
         let mut ready = dsh::port_ready();
         let mut waited_for_port = false;
+        let mut idle_timeout = false;
         if !ready {
-            match dsh::start_harness(&quitting) {
+            // 本次启动的输出活动追踪器：pump_dsh_output 每读到数据就 touch。
+            let activity = Arc::new(dsh::OutputActivity::new());
+            match dsh::start_harness(&quitting, activity.clone()) {
                 Ok(()) => {
-                    // 轮询端口就绪 (500ms 间隔，最长 120 秒)
                     waited_for_port = true;
-                    let deadline = Instant::now() + Duration::from_secs(120);
-                    while !ready && Instant::now() < deadline && !quitting.load(Ordering::SeqCst) {
+                    let started = Instant::now();
+                    let mut last_progress = started;
+                    while !ready && !quitting.load(Ordering::SeqCst) {
                         ready = dsh::port_ready();
                         if ready {
                             break;
+                        }
+                        let idle = activity.elapsed();
+                        if idle >= STARTUP_IDLE_TIMEOUT {
+                            // 已连续 120 秒没有新输出，才认为本次拉起可能卡死。
+                            idle_timeout = true;
+                            log::warn("等待 dsh 端口就绪：已 120 秒无新输出，结束本次等待");
+                            break;
+                        }
+                        if last_progress.elapsed() >= STARTUP_PROGRESS_INTERVAL {
+                            let _ = proxy.send_event(UserEvent::StartupProgress {
+                                elapsed_secs: started.elapsed().as_secs(),
+                                output_active: idle <= OUTPUT_ACTIVE_WINDOW,
+                            });
+                            last_progress = Instant::now();
                         }
                         thread::sleep(Duration::from_millis(500));
                     }
@@ -133,17 +159,17 @@ fn spawn_startup_flow(
             }
         }
         if !ready && !quitting.load(Ordering::SeqCst) {
-            if waited_for_port {
-                log::warn("等待 dsh 端口就绪超时 (120 秒)，watchdog 将重试");
+            if idle_timeout {
+                // 清理本次卡住的启动树，避免 watchdog 重试时叠加多个 npx/node。
+                log::warn("等待 dsh 端口就绪结束：清理本次启动树，watchdog 将重试");
+                dsh::stop_harness();
+            } else if waited_for_port {
+                log::warn("等待 dsh 端口就绪结束，watchdog 将重试");
             } else {
                 log::warn("dsh 启动失败，watchdog 将重试");
             }
         }
 
-        // 就绪后停止动画 (若在播放)
-        if ready {
-            set_anim(&anim_running, false, &proxy);
-        }
         log::info(&format!("启动流程结束 (就绪 = {ready})"));
         let _ = proxy.send_event(UserEvent::AnimationDone { ready });
     });
@@ -172,22 +198,34 @@ struct App {
     config_id: MenuId,
     restart_id: MenuId,
     quit_id: MenuId,
+    /// 重启菜单项句柄：点击后立即禁用，dsh 重新就绪后恢复，防止并发重复重启。
+    restart_item: MenuItem,
 }
 
 impl App {
-    /// 动画线程：动画播放期间每 150ms 发送一帧换帧事件 (不播放时仅轻量轮询)
+    /// 动画线程：只观察 anim_running 开关。
+    /// true 期间每 150ms 发一帧 AnimationTick；true→false 下降沿才发一次
+    /// AnimationStop。重复置 true 不产生额外状态变化。
     fn spawn_animator(&self) {
         let anim_running = self.anim_running.clone();
         let quitting = self.quitting.clone();
         let proxy = self.proxy.clone();
-        thread::spawn(move || loop {
-            if quitting.load(Ordering::SeqCst) {
-                break;
+        thread::spawn(move || {
+            let mut was_running = anim_running.load(Ordering::SeqCst);
+            loop {
+                if quitting.load(Ordering::SeqCst) {
+                    break;
+                }
+                let running = anim_running.load(Ordering::SeqCst);
+                if !running && was_running {
+                    let _ = proxy.send_event(UserEvent::AnimationStop);
+                }
+                was_running = running;
+                if running {
+                    let _ = proxy.send_event(UserEvent::AnimationTick);
+                }
+                thread::sleep(Duration::from_millis(150));
             }
-            if anim_running.load(Ordering::SeqCst) {
-                let _ = proxy.send_event(UserEvent::AnimationTick);
-            }
-            thread::sleep(Duration::from_millis(150));
         });
     }
 
@@ -209,7 +247,9 @@ impl App {
                 let ready = dsh::port_ready();
                 // 状态变化：驱动动画 (就绪停、未就绪跑)
                 if was_ready != Some(ready) {
-                    set_anim(&anim_running, !ready, &proxy);
+                    // 动画只由 watchdog 的“dsh 是否可连接”状态变化驱动：
+                    // 未就绪置 true，可连接置 false。
+                    set_anim(&anim_running, !ready);
                     was_ready = Some(ready);
                     // tooltip 同步运行状态 (flow 进行中时显示"启动中")
                     let _ = proxy.send_event(UserEvent::TooltipUpdate { ready });
@@ -224,12 +264,7 @@ impl App {
                 } else if !starting.swap(true, Ordering::SeqCst) {
                     // dsh 未运行且无启动流程：保活拉起 (端口被占时 flow 内自动清理)
                     log::info("dsh 未运行，触发保活拉起");
-                    spawn_startup_flow(
-                        proxy.clone(),
-                        starting.clone(),
-                        quitting.clone(),
-                        anim_running.clone(),
-                    );
+                    spawn_startup_flow(proxy.clone(), starting.clone(), quitting.clone());
                     fail_count += 1;
                 }
                 // 连续失败 3 次以上放慢到 30 秒一查
@@ -258,13 +293,24 @@ impl App {
         let _ = self.tray.set_tooltip(Some(&text));
     }
 
+    /// 启动等待进度 tooltip：明确告诉用户等待仍在进行，以及 dsh 是否还有输出。
+    fn update_startup_progress(&self, elapsed_secs: u64, output_active: bool) {
+        let state = if output_active {
+            "进程持续输出中"
+        } else {
+            "暂未收到新输出"
+        };
+        let text = format!("DshLauncher — dsh 启动中… (已等待 {elapsed_secs}s，{state})");
+        let _ = self.tray.set_tooltip(Some(&text));
+    }
+
     /// "打开"处理：先在后台探测 dsh 端口 (避免 500ms 探测阻塞主线程)，
     /// 同时立即登记待办并让扫描灯流动；探测到已就绪则直接打开并停止动画。
     fn handle_open(&self) {
         log::info("用户请求打开 dsh，后台探测端口");
         self.pending_open.store(true, Ordering::SeqCst);
         self.pending_from_restart.store(false, Ordering::SeqCst);
-        set_anim(&self.anim_running, true, &self.proxy);
+        set_anim(&self.anim_running, true);
         // 与动画同款即时反馈：tooltip 立即显示"启动中"
         self.update_tooltip(false, true);
 
@@ -272,6 +318,15 @@ impl App {
         thread::spawn(move || {
             let ready = dsh::port_ready();
             let _ = proxy.send_event(UserEvent::OpenProbeDone { ready });
+        });
+    }
+
+    /// 后台打开 dsh 页面：ShellExecuteW 不占用主线程，失败写入日志。
+    fn open_page_async() {
+        thread::spawn(|| {
+            if let Err(e) = dsh::open_page() {
+                log::error(&format!("打开 dsh 页面失败：{e}"));
+            }
         });
     }
 
@@ -287,9 +342,9 @@ impl App {
     /// KILL_ON_JOB_CLOSE 兜底崩溃场景。
     fn handle_quit(&mut self, event_loop: &ActiveEventLoop) {
         self.quitting.store(true, Ordering::SeqCst);
-        // 立即隐藏托盘图标 + 停止动画 (即时反馈)
+        // 立即隐藏托盘图标 + 关闭动画开关 (即时反馈)
         let _ = self.tray.set_visible(false);
-        set_anim(&self.anim_running, false, &self.proxy);
+        set_anim(&self.anim_running, false);
         // 提前释放单例互斥体：此时进程尚未退出，但新实例可以立即启动
         // (新实例的 watchdog 会自动接管 dsh 状态，旧进程仅剩清理收尾)
         if let Some(handle) = self.mutex_handle.take() {
@@ -320,16 +375,20 @@ impl ApplicationHandler<UserEvent> for App {
                     // 打开：检查 dsh 运行状态，未运行先启动
                     self.handle_open();
                 } else if ev.id() == &self.config_id {
-                    // 配置：资源管理器打开 dsh 配置目录 ~/.dsh
+                    // 配置：资源管理器打开 dsh 配置目录 ~/.dsh。
+                    // create_dir_all/ShellExecuteW 放到后台，主线程只负责菜单响应。
                     log::info("用户请求打开配置目录");
-                    if let Err(e) = dsh::open_config_dir() {
-                        log::error(&format!("打开配置目录失败：{e}"));
-                    }
+                    thread::spawn(|| {
+                        if let Err(e) = dsh::open_config_dir() {
+                            log::error(&format!("打开配置目录失败：{e}"));
+                        }
+                    });
                 } else if ev.id() == &self.restart_id {
-                    // 重启：立即让扫描灯流动 (动画由主线程事件循环驱动，
-                    // 终结 dsh 必须在后台线程执行，避免阻塞主线程导致动画延迟)
+                    // 重启：立即禁用重启菜单，防止并发重复重启；动画置 true 只改开关。
+                    // 终结 dsh 必须在后台线程执行，避免阻塞主线程导致动画延迟。
                     log::info("用户请求重启 dsh");
-                    set_anim(&self.anim_running, true, &self.proxy);
+                    self.restart_item.set_enabled(false);
+                    set_anim(&self.anim_running, true);
                     self.pending_open.store(true, Ordering::SeqCst);
                     self.pending_from_restart.store(true, Ordering::SeqCst);
                     // 与动画同款即时反馈：tooltip 立即显示"启动中"
@@ -356,44 +415,62 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::AnimationStop => {
-                // 停止动画：恢复默认图标
-                self.anim_idx = 0;
-                let _ = self.tray.set_icon(Some(self.default_icon.clone()));
+                // 下降沿恢复默认图标；若处理前开关又被置 true，则忽略这次遗留停止。
+                if !self.anim_running.load(Ordering::SeqCst) {
+                    self.anim_idx = 0;
+                    let _ = self.tray.set_icon(Some(self.default_icon.clone()));
+                }
             }
             UserEvent::AnimationDone { ready } => {
-                // 确保动画停止 (若 flow 已停则幂等)
-                set_anim(&self.anim_running, false, &self.proxy);
-                // flow 已结束 (starting 已释放)：tooltip 显示最终状态
-                self.update_tooltip(ready, false);
+                // 不在这里手动停动画：动画启停只由 watchdog 的“dsh 可连接”状态决定。
+                // flow 刚结束，读取实时 starting，避免旧 flow 事件覆盖新 flow 的 tooltip。
+                self.update_tooltip(ready, self.starting.load(Ordering::SeqCst));
                 if ready {
-                    // 成功：消费待办 (无论来源) 并打开页面
+                    // dsh 已拉起：恢复重启菜单可点击，并消费待办打开页面。
+                    self.restart_item.set_enabled(true);
                     self.pending_from_restart.store(false, Ordering::SeqCst);
                     if self.pending_open.swap(false, Ordering::SeqCst) {
-                        let _ = dsh::open_page();
+                        Self::open_page_async();
                     }
                 } else if self.pending_from_restart.swap(false, Ordering::SeqCst) {
-                    // 重启失败：清除待办 (避免 dsh 恢复后反复自动打开无意义页面)，保留日志
+                    // 重启失败：清除待办 (避免 dsh 恢复后反复自动打开无意义页面)，保留日志。
                     if self.pending_open.swap(false, Ordering::SeqCst) {
                         log::warn("重启失败：已清除打开待办 (dsh 未就绪，watchdog 将保活重试)");
                     }
                 }
-                // "打开"来源的待办在失败时保留 (P0-4：等下次就绪再消费)，此处不处理
+                // "打开"来源的待办在失败时保留：等下次就绪再消费，此处不处理。
             }
             UserEvent::TooltipUpdate { ready } => {
+                if ready {
+                    self.restart_item.set_enabled(true);
+                }
                 // 实时读 starting：事件到达时若 flow 已结束则显示最终状态，
                 // 避免竞态 (watchdog 事件与 AnimationDone 乱序) 导致 tooltip 卡"启动中"
                 self.update_tooltip(ready, self.starting.load(Ordering::SeqCst));
             }
             UserEvent::OpenProbeDone { ready } => {
                 if ready {
-                    set_anim(&self.anim_running, false, &self.proxy);
-                    self.update_tooltip(true, false);
-                    self.pending_from_restart.store(false, Ordering::SeqCst);
-                    if self.pending_open.swap(false, Ordering::SeqCst) {
-                        let _ = dsh::open_page();
+                    // 仅当没有重启流程时，这个“可连接”探测结果才允许关闭动画/打开页面；
+                    // 重启期间的旧探测结果不能覆盖重启动画，也不能消费重启待办。
+                    if !self.pending_from_restart.load(Ordering::SeqCst) {
+                        set_anim(&self.anim_running, false);
+                        self.update_tooltip(true, false);
+                        self.restart_item.set_enabled(true);
+                        if self.pending_open.swap(false, Ordering::SeqCst) {
+                            Self::open_page_async();
+                        }
                     }
                 } else {
                     log::info("dsh 未运行：登记打开待办，由 watchdog 拉起后就绪自动打开");
+                }
+            }
+            UserEvent::StartupProgress {
+                elapsed_secs,
+                output_active,
+            } => {
+                // 旧 flow 的迟到进度在 starting 已释放/被新 flow 占用时不显示。
+                if self.starting.load(Ordering::SeqCst) {
+                    self.update_startup_progress(elapsed_secs, output_active);
                 }
             }
         }
@@ -428,33 +505,34 @@ fn load_tray_icons() -> Result<Trayicons, Box<dyn Error>> {
         // 图标大小不变：直接铺满画布
         let mut frame = base.clone();
 
-        // 扫描仪灯管效果：中央不透明全白灯管 + 两侧线性衰减的半透明灯光。
-        // 灯管中心在整个图标宽度内来回扫动 (三角波 ping-pong)，
-        // 灯光溢出画布边缘的部分自然裁剪 (仅绘制画布内列)。
-        const LAMP_W: u32 = 2; // 灯管宽度 (不透明全白)
-        const LIGHT_W: i32 = 6; // 单侧灯光延伸宽度 (线性衰减)
-        const LIGHT_MAX: i32 = 180; // 灯光最大强度 (灯管旁)
-        let travel = 32 - LAMP_W; // 灯管中心移动范围：LAMP_W/2 ~ 32-LAMP_W/2
+        // 扫描仪灯管效果：2px 不透明全白灯管 + 单侧 6px 线性衰减半透明灯光。
+        // 灯管中心用连续坐标在 1.0~31.0 之间三角波扫动；逐列用像素中心
+        // (x+0.5) 计算覆盖，左右边界处灯管自然被画布裁切，保持 2px 宽度。
+        const LAMP_HALF: f32 = 1.0; // 灯管半宽 (总宽 2px)
+        const LIGHT_W: f32 = 6.0; // 单侧灯光延伸宽度 (线性衰减)
+        const LIGHT_MAX: f32 = 180.0; // 灯光最大强度 (紧邻灯管的理论值)
+        let travel = 32.0 - 2.0 * LAMP_HALF; // 灯管中心移动范围：1.0 ~ 31.0
         let tri = (2.0 * t).fract();
         let wave = 1.0 - (2.0 * tri - 1.0).abs();
-        let lamp_center = (LAMP_W as i32 / 2) + (wave * travel as f32) as i32;
+        let lamp_center = LAMP_HALF + wave * travel;
 
-        let half = LAMP_W as i32 / 2;
         // 逐列计算灯光强度并叠加 (alpha 混合，透明区域也能被灯光照亮)
         for x in 0..32u32 {
-            let dist = (x as i32 - lamp_center).abs();
-            let alpha = if dist <= half {
-                255 // 灯管：不透明全白
+            let pixel_center = x as f32 + 0.5;
+            let dist = (pixel_center - lamp_center).abs();
+            let alpha = if dist <= LAMP_HALF {
+                255.0 // 灯管：不透明全白
             } else {
-                let fall = dist - half;
+                let fall = dist - LAMP_HALF;
                 if fall < LIGHT_W {
                     LIGHT_MAX * (LIGHT_W - fall) / LIGHT_W
                 } else {
-                    0
+                    0.0
                 }
             };
+            let alpha = alpha.round().clamp(0.0, 255.0) as u8;
             if alpha > 0 {
-                let line = image::RgbaImage::from_pixel(1, 32, Rgba([255, 255, 255, alpha as u8]));
+                let line = image::RgbaImage::from_pixel(1, 32, Rgba([255, 255, 255, alpha]));
                 image::imageops::overlay(&mut frame, &line, x as i64, 0);
             }
         }
@@ -526,10 +604,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         config_id,
         restart_id,
         quit_id,
+        restart_item,
     };
 
-    // 程序启动即让扫描灯流动；watchdog 首轮探测到 dsh 就绪后自动停止
-    set_anim(&app.anim_running, true, &app.proxy);
+    // 程序启动即让扫描灯流动；watchdog 探测到 dsh 可连接后才关闭开关
+    set_anim(&app.anim_running, true);
     // 动画线程 + 守护线程
     app.spawn_animator();
     app.spawn_watchdog();
@@ -542,6 +621,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if app.quitting.load(Ordering::SeqCst) {
         dsh::stop_harness();
     }
+
+    // 日志已异步化：正常退出前等待日志管理线程处理完队列中的日志。
+    log::flush();
 
     Ok(())
 }

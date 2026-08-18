@@ -57,12 +57,30 @@ fn fetch_latest_version() -> Result<UpdateInfo, ()> {
     Err(())
 }
 
+/// 是否通过环境变量禁用更新检测 (开发/测试用)。
+/// 支持 1/true/yes/on (大小写不敏感)；未设置或其它值视为启用。
+fn update_check_disabled() -> bool {
+    std::env::var("DSHLAUNCHER_UPDATE_DISABLE")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// 后台检测线程：启动即首查一次，之后每 1 小时复查。
 /// 成功结果按日志日写入 launcher.log：进程启动写一次；运行跨过凌晨 4 点后写一次；
 /// 同一日志日内只有远端出现更新版本时才再写，避免每小时重复刷日志。
 /// 发现新版本且最近日志中未记录过该版本时直接通过 WinRT 发 toast。
 /// 发送失败会在本进程内按小时重试，成功后不再提示该版本。
 pub fn spawn_checker(quitting: Arc<AtomicBool>) {
+    if update_check_disabled() {
+        crate::log::info("更新检测已禁用 (DSHLAUNCHER_UPDATE_DISABLE)");
+        return;
+    }
     thread::spawn(move || {
         let mut next = Instant::now();
         let mut last_written_remote: Option<String> = None;
@@ -231,7 +249,8 @@ fn parse_release_json(body: &str) -> Option<UpdateInfo> {
     Some(UpdateInfo { version })
 }
 
-/// 提取 JSON 字符串字段 "key":"value" 的 value，处理常见转义
+/// 提取 JSON 字符串字段 "key":"value" 的 value，处理常见转义。
+/// 畸形 JSON (如孤立反斜杠/缺少闭合引号) 返回 None，不让解析线程 panic。
 fn extract_json_string(body: &str, key: &str) -> Option<String> {
     let pat = format!("\"{key}\"");
     let idx = body.find(&pat)? + pat.len();
@@ -239,19 +258,26 @@ fn extract_json_string(body: &str, key: &str) -> Option<String> {
     let colon = rest.find(':')? + 1;
     let after = rest[colon..].trim_start();
     let q = after.strip_prefix('"')?;
-    let mut i = 0;
-    let bytes = q.as_bytes();
-    while i < bytes.len() {
-        if bytes[i] == b'\\' {
-            i += 2;
+
+    // 用字符边界扫描，找到未转义的闭合引号；反斜杠后的任意字符都安全跳过。
+    let mut escaped = false;
+    let mut end = None;
+    for (idx, c) in q.char_indices() {
+        if escaped {
+            escaped = false;
             continue;
         }
-        if bytes[i] == b'"' {
+        if c == '\\' {
+            escaped = true;
+            continue;
+        }
+        if c == '"' {
+            end = Some(idx);
             break;
         }
-        i += 1;
     }
-    let raw = &q[..i];
+    let raw = &q[..end?];
+
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars();
     while let Some(c) = chars.next() {
@@ -269,6 +295,9 @@ fn extract_json_string(body: &str, key: &str) -> Option<String> {
     }
     Some(out)
 }
+
+/// 响应体上限：GitHub Releases JSON 远小于该值；防止异常镜像返回超大 body。
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 /// WinHTTP GET 请求：返回响应体文本；任何失败返回 Err。
 /// 走系统代理 (DEFAULT_PROXY)，各阶段超时见 WinHttpSetTimeouts。
@@ -358,12 +387,18 @@ fn http_get(url: &str) -> Result<String, ()> {
             WinHttpCloseHandle(session);
             return Err(());
         }
-        // 循环读取响应体
+        // 循环读取响应体，并限制单块与累计大小。
         let mut body = Vec::new();
         loop {
             let mut size: u32 = 0;
             if WinHttpQueryDataAvailable(request, &mut size) == 0 || size == 0 {
                 break;
+            }
+            if size as usize > MAX_RESPONSE_BYTES {
+                WinHttpCloseHandle(request);
+                WinHttpCloseHandle(connect);
+                WinHttpCloseHandle(session);
+                return Err(());
             }
             let mut buf = vec![0u8; size as usize];
             let mut read: u32 = 0;
@@ -377,7 +412,14 @@ fn http_get(url: &str) -> Result<String, ()> {
             {
                 break;
             }
-            body.extend_from_slice(&buf[..read as usize]);
+            let read = read as usize;
+            if body.len().saturating_add(read) > MAX_RESPONSE_BYTES {
+                WinHttpCloseHandle(request);
+                WinHttpCloseHandle(connect);
+                WinHttpCloseHandle(session);
+                return Err(());
+            }
+            body.extend_from_slice(&buf[..read]);
         }
         WinHttpCloseHandle(request);
         WinHttpCloseHandle(connect);
@@ -514,5 +556,25 @@ mod tests {
             extract_json_string(body, "html_url").as_deref(),
             Some("https://github.com/x")
         );
+    }
+
+    #[test]
+    fn update_disable_flag_parses_known_values() {
+        std::env::set_var("DSHLAUNCHER_UPDATE_DISABLE", "yes");
+        assert!(update_check_disabled());
+        std::env::set_var("DSHLAUNCHER_UPDATE_DISABLE", "0");
+        assert!(!update_check_disabled());
+        std::env::remove_var("DSHLAUNCHER_UPDATE_DISABLE");
+        assert!(!update_check_disabled());
+    }
+
+    #[test]
+    fn json_malformed_string_returns_none() {
+        // 孤立反斜杠 + 缺失闭合引号：解析器应返回 None，而不是 panic。
+        assert_eq!(
+            extract_json_string(r#"{"tag_name":"v26.8.18.1"#, "tag_name"),
+            None
+        );
+        assert_eq!(extract_json_string(r#"{"tag_name":v1}"#, "tag_name"), None);
     }
 }

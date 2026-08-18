@@ -11,7 +11,7 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 - 目录结构：
   - `src/main.rs`：托盘、菜单、watchdog、启动流程、动画
   - `src/dsh.rs`：dsh 进程控制 (启动/停止/端口探测)、ShellExecuteW、纯 Win32 进程树清理、单实例
-  - `src/log.rs`：单文件日志 `launcher.log` (启动器事件 + dsh 输出 `[DSH]`，按行时间标签 + 凌晨 4 点日界，保留 3 天；更新检测/通知记录按普通日志清理)
+  - `src/log.rs`：单文件日志 `launcher.log` (启动器事件 + dsh 输出 `[DSH]`，按行时间标签 + 凌晨 4 点日界，保留 3 天；写入/查询/清理全部由后台日志管理线程串行处理，其它线程只投递消息队列)
   - `src/toast.rs`：直接通过 WinRT 发送更新 toast，并登记自有 AUMID (不再启动 PowerShell)
   - `build.rs`：把 icons 下的 ICO 嵌入 PE 资源 (桌面 exe 图标)
   - `icons/`：DeepSeekHarness-WhaleGirl.ico (256x256，唯一图标源)
@@ -41,8 +41,8 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
    - 进程清理必须真实 spawn 子进程后终止。
    - 禁止只测“无目标时不出错”。
 3. **winit 主线程禁止任何可能阻塞的操作 (>10ms)**：
-   - `port_ready()`、sleep、网络、进程管理都放到后台线程。
-   - “打开”菜单用后台探测 + `OpenProbeDone` 事件。
+   - `port_ready()`、sleep、网络、进程管理、日志文件读改写都放到后台线程。
+   - “打开”菜单用后台探测 + `OpenProbeDone` 事件；`ShellExecuteW` 打开页面/配置目录也在后台线程执行。
 4. **CI 发布判定只比源码，不比二进制 hash**：
    - 使用 `git diff -b --name-only <上一发布tag>..HEAD`。
    - 只有 `Cargo.toml` / `Cargo.lock` / `build.rs` / `src/` / `icons/` 有非缩进变化才发布。
@@ -52,9 +52,10 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
    - 不得永久保留任何日志行绕过 3 天清理。
 6. **dsh 启动必须先挂 Job，再检查 quitting**：
    - spawn 后若先 `child.kill()`，cmd 已派生的 npx/node 会成为孤儿。
-7. **日志清理必须流式处理**：
+7. **日志清理必须流式处理，且只能在日志管理线程内执行**：
    - 禁止对 `launcher.log` 使用 `read_to_string` 后整体重写。
    - 必须逐行读、写临时文件、`rename` 替换。
+   - 其它线程只向日志线程消息队列投递 Write/Read/Flush，不在调用线程做文件 I/O。
 8. **dsh 输出必须保留未完成 UTF-8 尾字节**：
    - 无换行输出跨块时，不能用 `from_utf8_lossy` 直接丢弃多字节字符的剩余字节。
 9. **任何实现变化必须同步修改 AGENTS.md / README.md**：
@@ -90,26 +91,28 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 ### 启动流程 (spawn_startup_flow)
 - **Job Object + KILL_ON_JOB_CLOSE (核心设计)**：start_harness 把 dsh 进程树 (cmd→npx→node) 挂入全局 Job；DshLauncher 退出/崩溃/被强杀时 Job 句柄随进程关闭，Windows 自动终止 dsh —— 从设计上保证无孤儿残留，常态启动/退出**不需要清理流程**
 - 启动前仅当 `port_occupied()` (bind 探测失败 = 端口被外部进程占，毫秒级) 才 `stop_harness()` (TerminateJobObject 秒杀 + GetExtendedTcpTable/Toolhelp 纯 Win32 兜底)
-- `start_harness()` (仅一次) → 轮询端口就绪 (500ms 间隔，最长 120s)
-- 动画由独立动画线程驱动 (见"动画策略")，flow 不负责换帧
-- 结束：`starting` 自动释放 → 就绪时停动画 → 发 `AnimationDone { ready }` → 主线程按 `pending_open` 待办打开页面 (重启来源的待办在失败时清除)
+- `start_harness()` (仅一次) → 轮询端口就绪 (500ms 间隔)；超时以 dsh 输出活动为心跳：连续 120 秒无任何输出才结束等待，持续有输出不判超时，期间每 5 秒通过 `StartupProgress` 事件更新 tooltip
+- 动画由独立动画线程驱动 (见"动画策略")，flow 不负责换帧，也不手动停动画
+- 结束：`starting` 自动释放 → 发 `AnimationDone { ready }` → 主线程按 `pending_open` 待办打开页面 (重启来源的待办在失败时清除)；无输出超时会先 `stop_harness()` 清理本次启动树，避免 watchdog 重试时叠加进程
 - 停止 dsh = `TerminateJobObject` (毫秒级)；外部残留兜底用 `GetExtendedTcpTable` 找监听 PID + Toolhelp 快照递归 `TerminateProcess`，全程纯 Win32
 
 ### 事件流
 - 菜单/托盘事件：`MenuEvent::set_event_handler` / `TrayIconEvent::set_event_handler` → `EventLoopProxy::send_event` → `ApplicationHandler::user_event`
-- 自定义事件：`Menu` / `Tray` / `AnimationTick` (换一帧) / `AnimationStop` / `AnimationDone { ready }` / `TooltipUpdate { ready }` / `OpenProbeDone { ready }`
+- 自定义事件：`Menu` / `Tray` / `AnimationTick` (换一帧) / `AnimationStop` (开关下降沿) / `AnimationDone { ready }` / `TooltipUpdate { ready }` / `OpenProbeDone { ready }` / `StartupProgress { elapsed_secs, output_active }`
 
 ### 菜单行为
 - 打开：先在后台线程探测端口 (`OpenProbeDone` 回主线程)；就绪则直接 `open_page()`，未就绪则保留 `pending_open=true` + `set_anim(true)`，由 watchdog/flow 就绪后消费待办
 - 配置：`open_config_dir()` (见下)
-- 重启：点击瞬间 `set_anim(true)` (扫描灯立即流动) + `pending_open=true` + `thread::spawn(|| stop_harness())` (**必须异步**：动画换帧依赖主线程事件循环，同步执行带 sleep 的 stop 会阻塞主线程导致动画延迟出现)，watchdog 拉起，flow 就绪后停动画并打开页面
-- 退出：`quitting=true` → 隐藏托盘图标 (即时反馈) → 停止动画 → **提前 `CloseHandle` 释放单例互斥体** (新实例可立即启动) → `event_loop.exit()`；`stop_harness()` (Job 秒杀 + 外部残留兜底) 在 `run_app` 返回后执行，避免阻塞事件循环 (KILL_ON_JOB_CLOSE 兜底崩溃/异常退出场景)
+- 重启：点击瞬间 **禁用重启菜单项** (dsh 重新就绪后才恢复可点击) + `set_anim(true)` (扫描灯立即流动) + `pending_open=true` + `thread::spawn(|| stop_harness())` (**必须异步**：动画换帧依赖主线程事件循环，同步执行带 sleep 的 stop 会阻塞主线程导致动画延迟出现)，watchdog 拉起，watchdog 探测到就绪后停动画，flow 就绪后打开页面
+- 退出：`quitting=true` → 隐藏托盘图标 (即时反馈) → 关闭动画开关 → **提前 `CloseHandle` 释放单例互斥体** (新实例可立即启动) → `event_loop.exit()`；`stop_harness()` (Job 秒杀 + 外部残留兜底) 在 `run_app` 返回后执行，避免阻塞事件循环 (KILL_ON_JOB_CLOSE 兜底崩溃/异常退出场景)
   - 背景：若不提前释放，图标隐藏到进程退出的窗口期内新实例会被单例拒绝启动 (用户会以为程序没响应)
 - 左键单击无功能 (`with_menu_on_left_click(false)`)；左键双击等同"打开"
 
 ### 托盘动画 (16 帧，150ms/帧，扫描仪灯管定稿)
-- 图标大小不变；中央 2px 不透明全白灯管 + 单侧 6px 线性衰减半透明灯光 (灯管旁 alpha 180 → 远端 0)
-- 灯管中心在图标全宽 (1~31) 三角波来回扫动，灯光溢出画布边缘自然裁剪；逐列 overlay 叠加 (透明区域也能被照亮)
+- 动画只有一个 `AtomicBool` 开关：重复置 true 只刷新标志；只有 watchdog 确认 dsh 可连接 (或“打开”后台探测确认就绪且无重启流程) 才置 false
+- 动画线程观察 true→false 下降沿发送 `AnimationStop`；主线程处理时若开关又被置 true，则忽略迟到停止
+- 图标大小不变；2px 不透明全白灯管 + 单侧 6px 线性衰减半透明灯光
+- 灯管中心用连续坐标在 1.0~31.0 三角波来回扫动，逐列按像素中心计算；左右边界按画布裁切，灯管始终保持 2px；逐列 overlay 叠加 (透明区域也能被照亮)
 - 图标裁剪：以 PNG (984x984) 中心裁剪 760x760 的比例 (≈0.7724) 等比应用到 ICO 源 (256 → 中心 198)
 - 生成：`load_tray_icons()` 构建时一次性生成 (裁剪 + 逐帧绘制灯管/灯光列)
 - 默认图标与动画帧都从内嵌 ICO 解码 (`include_bytes!`，32x32 RGBA)
@@ -146,13 +149,13 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 - 曾用 PowerShell `Shell.Application` COM 遍历 `$shell.Windows()` 复用窗口，但隐藏 PowerShell 进程里 COM 枚举不稳定，导致点击「配置」不弹文件夹，已改为 ShellExecuteW
 
 ### build.rs (图标嵌入)
-- 动态生成 .rc (含 ICO 绝对路径) → 定位 rc.exe (`RC_EXE` 环境变量 → PATH → Windows Kits → VS 递归) → `rc /fo app.res` → `cargo:rustc-link-arg` 传 .res
+- 动态生成 .rc (含 ICO 绝对路径) → 定位 rc.exe (`RC_EXE` 环境变量 → PATH → Windows Kits → VS 标准固定路径精确匹配，不做全盘递归) → `rc /fo app.res` → `cargo:rustc-link-arg` 传 .res
 - 本机 rc.exe：`C:/Program Files (x86)/Windows Kits/10/bin/<ver>/x64/rc.exe`
 
 ## 版本号与 CI 发布
 
-- exe 版本号格式 `YY.MM.DD.NN` (年.月.日.当日第几次发布，各段固定两位补零，如 26.08.05.01)：CI 发布时经环境变量 `DSHLAUNCHER_VERSION` 传入 build.rs 嵌入 FILEVERSION；本地构建自动取构建当天本地日期 + 0 (Cargo.toml version 不参与 exe 版本)
-- build.rs 用 `rerun-if-env-changed=DSHLAUNCHER_VERSION` 保证版本变化触发重链接；`/Brepro` 仅用于产物可复现性，不再作为“是否发布”的判断依据
+- exe 版本号格式 `YY.MM.DD.NN` (年.月.日.当日第几次发布，各段固定两位补零，如 26.08.05.01)：CI 发布时经环境变量 `DSHLAUNCHER_VERSION` 传入 build.rs 嵌入 FILEVERSION；本地构建在 build.rs 重跑时取当天本地日期 + 0 (Cargo.toml version 不参与 exe 版本)
+- build.rs 声明 `src/`、`Cargo.toml`、`Cargo.lock`、图标与 `DSHLAUNCHER_VERSION` 为重跑输入：源码变化 → build.rs 重跑 → 取当天日期；只跨天而源码未变 → 不重跑 → 重复构建保持旧版本，符合 CI“源码无实质变化不发布”的逻辑；`/Brepro` 仅用于产物可复现性，不再作为“是否发布”的判断依据
 - CI 发布 (push 到 main 且涉及编译文件时触发，纯文档改动不触发)：
   1. 用 `git diff -b --name-only <上一发布tag>..HEAD` 获取有非缩进变化的文件
   2. 仅当变化文件包含 `Cargo.toml` / `Cargo.lock` / `build.rs` / `src/` / `icons/` 时发布；纯缩进变化、文档变化均跳过
@@ -161,7 +164,7 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 
 ## 更新检测
 
-- 检测源：GitHub Releases API 直连为主 (`https://api.github.com/repos/NekoPawClub/DshLauncher/releases/latest`)，失败依次尝试 gh-proxy 镜像前缀 (ghproxy.net、ghfast.top)；环境变量 `DSHLAUNCHER_UPDATE_MIRROR` 可自定义镜像前缀 (逗号分隔)，置于内置候选之前
+- 检测源：GitHub Releases API 直连为主 (`https://api.github.com/repos/NekoPawClub/DshLauncher/releases/latest`)，失败依次尝试 gh-proxy 镜像前缀 (ghproxy.net、ghfast.top)；环境变量 `DSHLAUNCHER_UPDATE_MIRROR` 可自定义镜像前缀 (逗号分隔)，置于内置候选之前；环境变量 `DSHLAUNCHER_UPDATE_DISABLE=1/true/yes/on` 可完全禁用检测 (开发/测试用)
 - 实现：WinHTTP (windows-sys `Win32_Networking_WinHttp`)，零第三方依赖，自动走系统代理；单请求超时 解析 3s/连接 5s/发送 8s/接收 8s
 - 版本比较：`YY.MM.DD.NN` 按 . 分段转数值逐段比较 (段长不固定，字符串字典序会误判)；本地版本由 build.rs 经 rustc-env 注入 (`env!("DSH_LAUNCHER_VERSION")`)
 - 检测节奏：启动即首查一次，之后每 1 小时复查；检测线程直接发 Windows 通知 (toast)，不占用主线程
@@ -200,7 +203,8 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 **安全测试组合 (三要素)：**
 1. `DSHLAUNCHER_PORT=39999` (隔离端口)
 2. `DSHLAUNCHER_INSTANCE=test` (互斥体后缀隔离，测试实例与用户实例共存)
-3. `PATH` 前置假 npx (`scripts/test-bin/npx.cmd`：`ping -n 60 127.0.0.1 >nul` 模拟 60 秒启动)
+3. `DSHLAUNCHER_UPDATE_DISABLE=1` (避免测试实例弹真实更新 toast)
+4. `PATH` 前置假 npx (`scripts/test-bin/npx.cmd`：`ping -n 60 127.0.0.1 >nul` 模拟 60 秒启动)
 
 **清理规则：** 一律 `Start-Process -PassThru` 拿 PID 按 `Stop-Process -Id` 清理；端口进程用 `netstat -ano | findstr :39999` 定位 PID。测试后必须确认用户实例仍存活。
 
@@ -208,27 +212,28 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 
 ## 动画策略 (全局动画控制器)
 
-- 动画由独立动画线程驱动：`anim_running` 为 true 时每 150ms 发 `AnimationTick` 换帧
-- `set_anim(running)` 自由函数供任意线程调用：停止时发 `AnimationStop` 事件恢复默认图标
+- 动画由独立动画线程驱动：`anim_running` 为 true 时每 150ms 发 `AnimationTick` 换帧；线程同时观察 true→false 下降沿，只在该边沿发 `AnimationStop`
+- `set_anim(running)` 只写 `AtomicBool`：重复置 true 不改变运行状态，也不直接发事件
 - **程序启动即让扫描灯流动**；watchdog 首轮探测 (`was_ready=None` 强制触发) 就绪后停止
-- watchdog 记录 `was_ready` 状态，dsh 就绪/失联状态变化时启停动画
-- 重启菜单：点击瞬间 `set_anim(true)` + 异步 stop，watchdog 拉起，flow 就绪后停动画并打开页面
-- **扫描仪灯管动画 (定稿)**：图标大小不变；中央 2px 不透明全白灯管 + 单侧 6px 线性衰减半透明灯光 (灯管旁 alpha 180 → 远端 0)，灯管中心在图标全宽 (1~31) 三角波来回扫动，灯光溢出画布边缘自然裁剪；逐列 overlay 叠加 (透明区域也能被照亮)
+- watchdog 记录 `was_ready` 状态：只有 dsh 可连接 (就绪) 才置 false；“打开”后台探测确认就绪且无重启流程时也可置 false；其它路径不手动停动画
+- 重启菜单：点击瞬间禁用重启项 + `set_anim(true)` + 异步 stop；watchdog 探测到新 dsh 就绪后停动画并恢复重启项，flow 就绪后打开页面
+- **扫描仪灯管动画 (定稿)**：图标大小不变；2px 不透明全白灯管 + 单侧 6px 线性衰减半透明灯光；灯管中心用连续坐标在 1.0~31.0 三角波扫动，逐列按像素中心计算，左右边界灯管被画布自然裁切且保持 2px；逐列 overlay 叠加 (透明区域也能被照亮)
 - 曾尝试并被否掉的方案：呼吸缩放 (1.0~1.5 放大呼吸)、底部滚动条 (白色 1/8~1/4 高度)、亮度高亮——需要时按 git 历史恢复
 
 ## 纯 Rust 化实现细节 (本次修复经验)
 
 - **CI 发布判定不要比二进制 hash，要比源码 diff**：用 `git diff -b --name-only <上一发布tag>..HEAD` 找非缩进变化文件；只有 `Cargo.toml`/`Cargo.lock`/`build.rs`/`src/`/`icons/` 中有变化才发布。工具链升级不会影响该判定。
 - **更新通知走 Rust/WinRT，不要经 PowerShell 代理**：`windows` crate (`Data_Xml_Dom` + `UI_Notifications`) 直接创建 `XmlDocument`/`ToastNotification`，`ToastNotificationManager::CreateToastNotifierWithId` 发送；AUMID 用 `windows-sys` 注册表 API 写 HKCU。exe 图标路径用百分号编码转 `file:///` URI。
-- **停止 dsh 的兜底也必须是纯 Win32**：`GetExtendedTcpTable` 找监听 PID，Toolhelp 快照构建进程树，先子后父 `TerminateProcess`；不要再回到 `netstat`/`taskkill`/PowerShell。
+- **停止 dsh 的兜底也必须是纯 Win32**：`GetExtendedTcpTable` 找监听 PID，Toolhelp 快照构建进程树，先子后父 `TerminateProcess`；快照同时读取 exe 名称，只终止 `node.exe`/`cmd.exe`/`dsh.exe`/`npx.exe` 等已知 dsh 进程，避免端口误配时误杀无关服务；不要再回到 `netstat`/`taskkill`/PowerShell。
 - **Job 挂接要先于 quitting 检查**：spawn `cmd /c npx` 后若先 `child.kill()` 再挂 Job，cmd 已派生的 npx/node 会成孤儿；必须先挂 Job，失败/退出路径用整树清理。
 - **主线程不要同步 `port_ready()`**：`connect_timeout` 最长 500ms 会卡动画；“打开”菜单改为后台探测 + `OpenProbeDone` 事件回主线程。
-- **start_harness 的 Err 不能吞掉**：否则启动失败会误报“等待 120 秒超时”；要区分“启动失败”和“等待就绪超时”。
+- **start_harness 的 Err 不能吞掉**：否则启动失败会误报“无输出超时”；要区分“启动失败”和“等待就绪无输出超时”。
+- **启动超时以输出活动为心跳**：连续 120 秒无 dsh 输出才结束等待；只要有持续输出就不超时，并通过 tooltip 显示已等待时长/是否仍在输出。
 - **toast 成功后再写“已发送”日志**：发送失败记录具体错误并在本进程按小时重试，避免假成功且不再重试。
-- **日志清理要流式**：dsh 输出合并后日志可能很大，`read_to_string` 全量清理会阻塞所有写入；改为逐行读 + 临时文件 + `rename` 替换。
+- **日志清理要流式，且必须在日志管理线程**：dsh 输出合并后日志可能很大，`read_to_string` 全量清理会阻塞所有写入；改为逐行读 + 临时文件 + `rename` 替换；写日志只投递消息队列，清理不会卡主线程或 dsh 输出读取线程。
 - **dsh 输出按块落盘要保留 UTF-8 尾字节**：无换行输出跨 16 KiB 块时，不能直接 `from_utf8_lossy` 截断多字节字符；保留 `error_len() == None` 的尾字节，非法字节才 lossy 落盘。
 - **DSHLAUNCHER_INSTANCE 要统一清洗**：trim + 只保留 `[A-Za-z0-9_-]`，日志文件名和单实例互斥体共用同一结果，防止路径穿越和命名不一致。
-- **rc.exe 兜底查找要按主机架构选择**：Windows Kits 路径与 VS 递归结果都要优先 x64/x86/arm64 中匹配 `std::env::consts::ARCH` 的候选。
+- **rc.exe 兜底查找要按主机架构选择**：Windows Kits 与 VS 标准路径结果都要优先 x64/x86/arm64 中匹配 `std::env::consts::ARCH` 的候选；VS 只按 `<root>/<year>/<edition>/VC/Tools/MSVC/<ver>/bin/Host<host>/<target>/rc.exe` 精确拼接，禁止盲目递归。
 - **自定义更新镜像按 URL scheme 决定 `WINHTTP_FLAG_SECURE`**：不要固定 HTTPS flag，否则 `DSHLAUNCHER_UPDATE_MIRROR=http://...` 无法工作。
 
 ## 调试经验 (踩坑实录)

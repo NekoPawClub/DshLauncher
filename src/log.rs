@@ -2,13 +2,18 @@
 //! 仅保留最近 3 天，过时日志按每行开头的时间标签清理。
 //!
 //! 守护程序无控制台窗口，故障诊断依赖此日志。
-//! 记录点：watchdog 端口状态与拉起、启动流程起止、Job 操作成败、stop 脚本执行、
+//! 写入、查询与清理统一由后台日志管理线程串行执行；其它线程只向消息队列投递，
+//! 主线程不会因日志文件读改写 (含 3 天清理) 而阻塞。
+//! 记录点：watchdog 端口状态与拉起、启动流程起止、Job 操作成败、stop 清理流程、
 //! dsh 子进程 (npx/node) 输出、更新检测与更新通知。
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::mpsc::{self, Sender, SyncSender};
+use std::sync::OnceLock;
+use std::thread;
+use std::time::Duration;
 
 use windows_sys::Win32::Foundation::SYSTEMTIME;
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
@@ -16,13 +21,50 @@ use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 /// 日志保留天数 (含今天)
 const KEEP_DAYS: i64 = 3;
 
-/// 写入与清理互斥：避免清理重写文件时与追加写入互相踩踏
-static LOG_LOCK: Mutex<()> = Mutex::new(());
+/// 日志管理线程的命令队列：写日志、查询在线版本、刷新等待都由该线程串行处理。
+enum LogCommand {
+    Write { level: &'static str, msg: String },
+    ReadLastUpdateVersion { reply: SyncSender<Option<String>> },
+    Flush { reply: SyncSender<()> },
+}
 
-/// 上次清理时所在的日志日：避免每次写入都扫描目录，一天只清理一次
-static LAST_CLEANUP: Mutex<Option<(i64, u32, u32)>> = Mutex::new(None);
+/// 全局日志队列发送端 (首次写日志时启动管理线程)。
+static LOG_TX: OnceLock<Sender<LogCommand>> = OnceLock::new();
 
-/// 日志目录：DSHLAUNCHER_LOG_DIR 覆盖 (沙箱/CI 调试钩子)，否则 %USERPROFILE%\.dsh
+fn log_tx() -> Sender<LogCommand> {
+    LOG_TX
+        .get_or_init(|| {
+            let (tx, rx) = mpsc::channel();
+            thread::Builder::new()
+                .name("dsh-launcher-log".to_string())
+                .spawn(move || log_loop(rx))
+                .expect("无法启动日志管理线程");
+            tx
+        })
+        .clone()
+}
+
+/// 日志管理线程：串行执行清理与追加写入；查询在写入之间完成，
+/// 因此不再需要跨线程文件锁。
+fn log_loop(rx: mpsc::Receiver<LogCommand>) {
+    let mut last_cleanup_day: Option<(i64, u32, u32)> = None;
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            LogCommand::Write { level, msg } => {
+                cleanup_if_day_changed(&mut last_cleanup_day);
+                append_line(level, &msg);
+            }
+            LogCommand::ReadLastUpdateVersion { reply } => {
+                let _ = reply.send(read_last_logged_update_version_now());
+            }
+            LogCommand::Flush { reply } => {
+                let _ = reply.send(());
+            }
+        }
+    }
+}
+
+/// 日志目录：DSHLAUNCHER_LOG_DIR 覆盖 (沙箱/CI 调试钩子)，否则 %USERPROFILE%/.dsh
 pub(crate) fn log_base_dir() -> PathBuf {
     match std::env::var("DSHLAUNCHER_LOG_DIR") {
         Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
@@ -173,11 +215,26 @@ fn parse_update_check_line(line: &str) -> Option<(String, (i64, u32, u32))> {
     Some((version, log_day_of(&st)))
 }
 
-/// 读取 launcher.log 中最近一次写入的在线版本号 (流式扫描，避免大日志整体读入内存)。
+/// 读取 launcher.log 中最近一次写入的在线版本号。
+/// 通过消息队列交给日志管理线程读取，避免更新检测线程与清理/追加写入并发操作文件。
 /// 只统计仍在 3 天保留窗口内的检查行；过期的检查行等同不存在，
 /// 下次检查会重新写入并允许再次提示。
 pub(crate) fn last_logged_update_version() -> Option<String> {
-    let _guard = LOG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    if log_tx()
+        .send(LogCommand::ReadLastUpdateVersion { reply: reply_tx })
+        .is_err()
+    {
+        return None;
+    }
+    reply_rx
+        .recv_timeout(Duration::from_secs(30))
+        .ok()
+        .flatten()
+}
+
+/// 日志管理线程内执行的读取：同一时刻只有本线程访问日志文件。
+fn read_last_logged_update_version_now() -> Option<String> {
     let today = current_log_day();
     let cutoff = days_from_civil(today.0, today.1, today.2) - (KEEP_DAYS - 1);
     let file = File::open(log_path()).ok()?;
@@ -320,15 +377,14 @@ fn remove_legacy_daily_logs(base: &Path, cutoff: i64) {
     }
 }
 
-/// 清理日志：删除旧版过期的按天日志文件，并按行时间标签清理 launcher.log 中的过时日志。
-/// 调用方必须已持有 LOG_LOCK。
-fn cleanup_old_logs() {
+/// 跨凌晨 4 点日志日后执行一次清理：旧版按天日志文件删除 + launcher.log 流式裁剪。
+/// 只在日志管理线程内调用，清理期间该线程停止消费队列，但主线程与 dsh 读取线程不受阻塞。
+fn cleanup_if_day_changed(last_cleanup_day: &mut Option<(i64, u32, u32)>) {
     let today = current_log_day();
-    let mut last = LAST_CLEANUP.lock().unwrap_or_else(|p| p.into_inner());
-    if *last == Some(today) {
+    if *last_cleanup_day == Some(today) {
         return;
     }
-    *last = Some(today);
+    *last_cleanup_day = Some(today);
 
     let today_days = days_from_civil(today.0, today.1, today.2);
     let cutoff = today_days - (KEEP_DAYS - 1); // 今天及之前 2 天保留
@@ -340,14 +396,19 @@ fn cleanup_old_logs() {
     prune_log_file(path.as_path(), cutoff);
 }
 
-fn write(level: &str, msg: &str) {
-    let _guard = LOG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    cleanup_old_logs();
+/// 日志管理线程内执行：追加一行日志。所有调用方都已经把消息放入队列。
+fn append_line(level: &str, msg: &str) {
     let path = log_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let line = format!("{} [{}] {}\n", timestamp(), level, msg);
+    let line = format!(
+        "{} [{}] {}
+",
+        timestamp(),
+        level,
+        msg
+    );
     match OpenOptions::new().create(true).append(true).open(&path) {
         Ok(mut f) => {
             let _ = f.write_all(line.as_bytes());
@@ -355,6 +416,26 @@ fn write(level: &str, msg: &str) {
         Err(e) => {
             eprintln!("[log] 打开日志文件失败 {}: {e}", path.display());
         }
+    }
+}
+
+fn write(level: &'static str, msg: &str) {
+    // 主线程与各后台线程都只投递消息；真正的磁盘写入/清理在日志管理线程完成。
+    let _ = log_tx().send(LogCommand::Write {
+        level,
+        msg: msg.to_string(),
+    });
+}
+
+/// 等待日志管理线程处理完此前投递的全部消息。
+/// 供测试与正常退出收尾使用 (进程被强杀时仍允许丢失最后少量日志)。
+pub fn flush() {
+    let Some(tx) = LOG_TX.get() else {
+        return;
+    };
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    if tx.send(LogCommand::Flush { reply: reply_tx }).is_ok() {
+        let _ = reply_rx.recv_timeout(Duration::from_secs(5));
     }
 }
 
@@ -442,6 +523,7 @@ mod tests {
         std::env::set_var("DSHLAUNCHER_LOG_DIR", &tmp);
         std::env::set_var("DSHLAUNCHER_INSTANCE", "");
         info("单元测试日志写入验证");
+        flush();
         let path = log_path();
         assert!(path.is_file(), "日志文件应已创建：{}", path.display());
         assert_eq!(
@@ -455,6 +537,16 @@ mod tests {
             content.contains("单元测试日志写入验证"),
             "日志内容应包含写入信息，实际：{content}"
         );
+
+        // 验证异步日志队列的读取查询路径：写 -> flush -> 管理线程内流式读取
+        info("更新检测成功：远端 v26.08.18.01 (本地 v26.08.18.00)");
+        flush();
+        assert_eq!(
+            last_logged_update_version().as_deref(),
+            Some("26.08.18.01"),
+            "日志管理线程应能读取到刚写入的在线版本"
+        );
+
         std::env::remove_var("DSHLAUNCHER_INSTANCE");
         std::env::remove_var("DSHLAUNCHER_LOG_DIR");
         let _ = std::fs::remove_file(&path);

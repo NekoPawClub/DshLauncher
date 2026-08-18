@@ -6,9 +6,9 @@ use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS,
@@ -92,6 +92,31 @@ pub fn port_occupied() -> bool {
     port_occupied_at(web_port())
 }
 
+/// dsh 启动后的输出活动追踪器：读取线程每收到数据就 touch。
+/// 启动流程以“最近一次输出距今多久”作为超时依据，只要还有持续输出就不判超时。
+pub struct OutputActivity {
+    last: Mutex<Instant>,
+}
+
+impl OutputActivity {
+    pub fn new() -> Self {
+        Self {
+            last: Mutex::new(Instant::now()),
+        }
+    }
+
+    fn touch(&self) {
+        let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+        *last = Instant::now();
+    }
+
+    /// 距离上次收到 dsh 输出已经过去多久。
+    pub fn elapsed(&self) -> Duration {
+        let last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+        last.elapsed()
+    }
+}
+
 /// HANDLE 的 Send+Sync 包装 (静态 Mutex 变量要求裸指针可跨线程共享)
 struct JobHandle(HANDLE);
 unsafe impl Send for JobHandle {}
@@ -170,11 +195,15 @@ fn shell_execute_open(target: &str) -> io::Result<()> {
             std::ptr::null(),     // 无工作目录
             SW_SHOWNORMAL,
         );
-        // 返回值大于 32 表示成功
+        // 返回值大于 32 表示成功；<=32 是 ShellExecute 自身的错误码，
+        // 不能使用 GetLastError 结果，否则会报告无关的系统错误。
         if result as isize > 32 {
             Ok(())
         } else {
-            Err(io::Error::last_os_error())
+            Err(io::Error::other(format!(
+                "ShellExecuteW 失败 (错误码 {})",
+                result as isize
+            )))
         }
     }
 }
@@ -210,7 +239,9 @@ fn listener_pids(port: u16) -> Vec<u32> {
         if ret != ERROR_INSUFFICIENT_BUFFER || size == 0 {
             return Vec::new();
         }
-        let mut buf = vec![0u8; size as usize];
+        // 用 u64 数组分配，保证缓冲区对齐满足 MIB_TCPTABLE_OWNER_PID 的要求。
+        let units = (size as usize).div_ceil(std::mem::size_of::<u64>());
+        let mut buf = vec![0u64; units];
         let ret = GetExtendedTcpTable(
             buf.as_mut_ptr() as *mut core::ffi::c_void,
             &mut size,
@@ -255,6 +286,51 @@ fn process_snapshot() -> Vec<(u32, u32)> {
         CloseHandle(snapshot);
         out
     }
+}
+
+/// 枚举进程快照并附带小写可执行文件名，用于清理前识别占用端口的是否为 dsh 进程。
+fn process_snapshot_with_names() -> Vec<(u32, u32, String)> {
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                out.push((
+                    entry.th32ProcessID,
+                    entry.th32ParentProcessID,
+                    process_entry_exe_name(&entry),
+                ));
+                entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+        out
+    }
+}
+
+/// 读取 PROCESSENTRY32W.szExeFile，返回小写文件名。
+fn process_entry_exe_name(entry: &PROCESSENTRY32W) -> String {
+    let end = entry
+        .szExeFile
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(entry.szExeFile.len());
+    String::from_utf16_lossy(&entry.szExeFile[..end]).to_lowercase()
+}
+
+/// dsh 由 `cmd.exe /c npx ...` 启动，最终监听者通常是 node.exe；
+/// 外部残留也可能直接是 cmd/dsh。只有这些已知名称才允许兜底整树终止，
+/// 避免 DSHLAUNCHER_PORT 误配到无关服务时误杀。
+fn is_dsh_process_name(exe_name: &str) -> bool {
+    matches!(exe_name, "node.exe" | "cmd.exe" | "dsh.exe" | "npx.exe")
 }
 
 /// 用 TerminateProcess 结束单个进程；跳过本进程。
@@ -315,9 +391,32 @@ pub fn stop_harness() {
         let pids = listener_pids(web_port());
         if pids.is_empty() {
             crate::log::warn("未找到占用端口的监听进程，放弃兜底清理");
+            return;
+        }
+
+        // 先识别监听进程名称，只终止已知的 dsh 进程树；
+        // 快照中查不到名称时保守清理 (权限不足时优先保证 dsh 不残留)。
+        let named = process_snapshot_with_names();
+        let mut roots = Vec::new();
+        let mut skipped = Vec::new();
+        for &pid in &pids {
+            match named.iter().find(|(id, _, _)| *id == pid) {
+                Some((_, _, name)) if !is_dsh_process_name(name) => {
+                    skipped.push((pid, name.clone()));
+                }
+                _ => roots.push(pid),
+            }
+        }
+        if !skipped.is_empty() {
+            crate::log::warn(&format!(
+                "端口占用者不是已知 dsh 进程，拒绝误杀：{skipped:?}"
+            ));
+        }
+        if roots.is_empty() {
+            crate::log::warn("未找到可安全终止的 dsh 监听进程，放弃兜底清理");
         } else {
-            crate::log::info(&format!("终止占用端口的进程树，根 PID：{pids:?}"));
-            kill_process_tree(&pids);
+            crate::log::info(&format!("终止占用端口的进程树，根 PID：{roots:?}"));
+            kill_process_tree(&roots);
         }
     }
 }
@@ -327,7 +426,7 @@ pub fn stop_harness() {
 /// 不再需要单独的 dsh.log 与 1 MiB 清空逻辑。
 /// 按读取块切分：遇到换行按行写入；没有换行也随块落盘，
 /// 同时保留未完成的 UTF-8 尾字节，避免多字节字符被块边界截断。
-fn pump_dsh_output<R: Read + Send + 'static>(mut reader: R) {
+fn pump_dsh_output<R: Read + Send + 'static>(mut reader: R, activity: Arc<OutputActivity>) {
     thread::spawn(move || {
         let mut chunk = [0u8; 16 * 1024];
         let mut pending = Vec::new();
@@ -342,6 +441,9 @@ fn pump_dsh_output<R: Read + Send + 'static>(mut reader: R) {
             if n == 0 {
                 break;
             }
+            // 只要有输出 (无论 stdout/stderr) 就刷新活动时间戳：
+            // 启动流程据此判定 dsh 是否仍在持续工作，而不是固定 120 秒超时。
+            activity.touch();
             pending.extend_from_slice(&chunk[..n]);
 
             while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
@@ -402,7 +504,7 @@ fn kill_child_tree(child: &mut Child) {
 /// (时间标签 + [DSH] 标记)，与启动器日志合并，不再使用单独的 dsh.log。
 /// spawn 后立即挂入全局 Job (KILL_ON_JOB_CLOSE)，再检查退出请求：
 /// 任何失败路径都清理整棵进程树，避免 cmd 已派生 npx/node 后留下孤儿。
-pub fn start_harness(quitting: &AtomicBool) -> io::Result<()> {
+pub fn start_harness(quitting: &AtomicBool, activity: Arc<OutputActivity>) -> io::Result<()> {
     let home = home_dir();
     let port = web_port();
     let web_cmd = if port == DEFAULT_PORT {
@@ -457,8 +559,8 @@ pub fn start_harness(quitting: &AtomicBool) -> io::Result<()> {
         .stderr
         .take()
         .ok_or_else(|| io::Error::other("无法获取 dsh stderr 管道"))?;
-    pump_dsh_output(stdout);
-    pump_dsh_output(stderr);
+    pump_dsh_output(stdout, activity.clone());
+    pump_dsh_output(stderr, activity);
 
     crate::log::info(&format!(
         "已启动 dsh ({web_cmd}) 并挂入 Job，输出已并入 launcher.log"
@@ -582,6 +684,16 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn dsh_process_name_allowlist_rejects_unrelated_services() {
+        assert!(is_dsh_process_name("node.exe"));
+        assert!(is_dsh_process_name("cmd.exe"));
+        assert!(is_dsh_process_name("dsh.exe"));
+        assert!(is_dsh_process_name("npx.exe"));
+        assert!(!is_dsh_process_name("svchost.exe"));
+        assert!(!is_dsh_process_name("python.exe"));
     }
 
     #[test]
