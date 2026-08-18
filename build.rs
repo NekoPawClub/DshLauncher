@@ -25,7 +25,7 @@ fn main() {
     let ico_rc = ico_path.to_string_lossy().replace('\\', "/");
 
     // exe 版本四段 (YY.MM.DD.NN)：CI 发布时由环境变量 DSHLAUNCHER_VERSION 传入
-    // (如 26.8.18.1)；本地构建回退 Cargo.toml 的 YY.MM.DD + 0。
+    // (如 26.8.18.1)；本地构建回退为构建当天的本地日期 + 0。
     let (v1, v2, v3, v4) = exe_version();
 
     // 动态生成 rc 文件：应用图标 + 版本信息资源 (VS_VERSION_INFO)。
@@ -95,7 +95,8 @@ END
 }
 
 /// exe 版本四段 (YY.MM.DD.NN)：优先环境变量 DSHLAUNCHER_VERSION
-/// (CI 发布时传入，如 26.8.18.1)，否则回退 Cargo.toml 的 YY.MM.DD + 0
+/// (CI 发布时传入，如 26.8.18.1)；本地构建回退为构建当天的本地日期 + 0，
+/// 版本自动跟随日期，无需手工更新
 fn exe_version() -> (u32, u32, u32, u32) {
     if let Ok(v) = std::env::var("DSHLAUNCHER_VERSION") {
         let parts: Vec<u32> = v.split('.').filter_map(|s| s.parse().ok()).collect();
@@ -103,14 +104,41 @@ fn exe_version() -> (u32, u32, u32, u32) {
             return (parts[0], parts[1], parts[2], parts[3]);
         }
     }
-    let pkg = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "26.8.18".to_string());
-    let parts: Vec<u32> = pkg.split('.').filter_map(|s| s.parse().ok()).collect();
-    (
-        parts.first().copied().unwrap_or(0),
-        parts.get(1).copied().unwrap_or(0),
-        parts.get(2).copied().unwrap_or(0),
-        0,
-    )
+    let (yy, mm, dd) = local_date();
+    (yy, mm, dd, 0)
+}
+
+/// 当前本地日期 (YY, MM, DD)：kernel32!GetLocalTime，不引入第三方日期依赖。
+/// 仅用于本地构建回退；CI 发布由 DSHLAUNCHER_VERSION 提供版本，不受影响。
+fn local_date() -> (u32, u32, u32) {
+    #[repr(C)]
+    struct SystemTimeLocal {
+        w_year: u16,
+        w_month: u16,
+        w_day_of_week: u16,
+        w_day: u16,
+        w_hour: u16,
+        w_minute: u16,
+        w_second: u16,
+        w_milliseconds: u16,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLocalTime(st: *mut SystemTimeLocal);
+    }
+    let mut st = SystemTimeLocal {
+        w_year: 0,
+        w_month: 0,
+        w_day_of_week: 0,
+        w_day: 0,
+        w_hour: 0,
+        w_minute: 0,
+        w_second: 0,
+        w_milliseconds: 0,
+    };
+    // SAFETY: st 为栈上有效指针，GetLocalTime 写入本地系统时间
+    unsafe { GetLocalTime(&mut st) };
+    ((st.w_year % 100) as u32, st.w_month as u32, st.w_day as u32)
 }
 
 /// 依次尝试：环境变量 RC_EXE → PATH → Windows Kits → VS 安装目录
