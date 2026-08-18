@@ -35,6 +35,12 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘启动器，使用 Rust 编写。
 - 推送 main 且改动涉及编译文件时，CI 自动执行两步发布：先用上一发布版本号编译并与上一 Release 产物对比 SHA256 (一致则不发布，如仅注释改动)；有变化则按北京时间当日计数生成 `vYY.MM.DD.NN` tag 与 Release (正文为上一发布以来的提交列表)
 - 纯文档改动 (README/AGENTS 等) 不触发 CI
 
+## 更新检测
+
+- 托盘菜单「检查更新」：启动 30 秒后自动检测一次，之后每 24 小时复查；手动点击立即检测
+- 检测源：GitHub Releases API 直连为主，失败自动切换 gh-proxy 镜像；可用环境变量 `DSHLAUNCHER_UPDATE_MIRROR` 自定义镜像前缀
+- 发现新版后菜单项变为「更新到 vXX」，点击打开 GitHub Release 页面手动下载替换；tooltip 同时附加新版本提示
+
 ## 端口
 
 默认使用 3080；如需覆盖，请在启动 DshLauncher 前设置环境变量 `DSHLAUNCHER_PORT`。

@@ -173,6 +173,11 @@ pub fn open_page() -> io::Result<()> {
     shell_execute_open(&web_url())
 }
 
+/// 用系统默认方式 (ShellExecuteW) 打开任意 URL (如更新发布页)，不产生任何控制台窗口
+pub fn open_url(target: &str) -> io::Result<()> {
+    shell_execute_open(target)
+}
+
 /// 用资源管理器打开 dsh 配置目录 (~/.dsh)。
 /// 先确保目录存在，再通过 ShellExecuteW 直接让系统资源管理器打开；
 /// 不再依赖隐藏 PowerShell 进程里的 Shell.Application COM 枚举 (该方案在部分环境不弹窗)。

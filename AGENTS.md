@@ -103,6 +103,15 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
   2. 第二步计算当日发布号 NN (北京时间，当日已发布数 + 1)，以 `vYY.MM.DD.NN` 为 tag 与标题发布 Release，正文为上一发布以来 `git log` 的提交列表
 - 发布由 `gh release create` 完成 (自动打 tag)，workflow 需要 `permissions: contents: write`
 
+## 更新检测
+
+- 检测源：GitHub Releases API 直连为主 (`https://api.github.com/repos/Antecer/DshLauncher/releases/latest`)，失败依次尝试 gh-proxy 镜像前缀 (ghproxy.net、ghfast.top)；环境变量 `DSHLAUNCHER_UPDATE_MIRROR` 可自定义镜像前缀 (逗号分隔)，置于内置候选之前
+- 实现：WinHTTP (windows-sys `Win32_Networking_WinHttp`)，零第三方依赖，自动走系统代理；单请求超时 解析 3s/连接 5s/发送 8s/接收 8s
+- 版本比较：`YY.MM.DD.NN` 按 . 分段转数值逐段比较 (段长不固定，字符串字典序会误判)；本地版本由 build.rs 经 rustc-env 注入 (`env!("DSH_LAUNCHER_VERSION")`)
+- 检测节奏：启动 30 秒后首查，之后每 24 小时复查；菜单"检查更新"置位原子标志即时触发
+- 反馈：发现新版 → 菜单项文本变"更新到 vXX" + tooltip 附加"· 新版本 vXX"，点击打开发布页；手动检查无新版 → 菜单文本"已是最新版本"；手动检查失败 → "检查失败，点击重试"；自动检查失败静默 (仅日志)
+- 发布页地址来自 API 响应的 html_url 字段，与 tag_name 一起手工解析 (零 serde)
+
 ## 构建
 
 ### 用户机器 (正常网络)

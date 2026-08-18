@@ -84,6 +84,8 @@ END
         .expect("rc.exe 启动失败");
     assert!(status.success(), "rc.exe 编译资源失败 (退出码 {status})");
 
+    // 运行时版本常量：update 模块据此与远端最新版本比较
+    println!("cargo:rustc-env=DSH_LAUNCHER_VERSION={v1}.{v2}.{v3}.{v4}");
     // 将生成的 .res 交给链接器
     println!("cargo:rustc-link-arg={}", res_file.display());
     // 可重现构建：PE 时间戳归零，同源码产物 hash 稳定 (CI 靠 hash 判断是否需要发布)

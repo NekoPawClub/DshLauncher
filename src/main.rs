@@ -14,6 +14,7 @@
 
 mod dsh;
 mod log;
+mod update;
 
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,6 +43,11 @@ enum UserEvent {
     /// tooltip 状态更新：dsh 运行状态显示
     TooltipUpdate {
         ready: bool,
+    },
+    /// 更新检测结果：Ok(Some)=发现新版，Ok(None)=已最新，Err=全部源不可达
+    UpdateChecked {
+        result: Result<Option<update::UpdateInfo>, ()>,
+        manual: bool,
     },
 }
 
@@ -153,6 +159,16 @@ struct App {
     config_id: MenuId,
     restart_id: MenuId,
     quit_id: MenuId,
+    /// "检查更新"菜单项 (文本动态变化) 与 id
+    update_item: MenuItem,
+    update_id: MenuId,
+    /// 手动检查触发标志 (检测线程轮询)
+    update_check: Arc<AtomicBool>,
+    /// 已发现的新版本号与发布页地址 (菜单/tooltip 提示用)
+    update_version: Option<String>,
+    update_url: Option<String>,
+    /// 最近一次 tooltip 的 dsh 就绪状态 (发现新版后重算 tooltip 用)
+    tooltip_ready: bool,
 }
 
 impl App {
@@ -227,8 +243,9 @@ impl App {
         });
     }
 
-    /// 更新托盘 tooltip：反映 dsh 运行状态
-    fn update_tooltip(&self, ready: bool, starting: bool) {
+    /// 更新托盘 tooltip：反映 dsh 运行状态；发现新版本时附加提示
+    fn update_tooltip(&mut self, ready: bool, starting: bool) {
+        self.tooltip_ready = ready;
         let text = if ready {
             format!("DshLauncher — dsh 运行中 (端口 {})", dsh::web_port())
         } else if starting {
@@ -236,12 +253,17 @@ impl App {
         } else {
             "DshLauncher — dsh 未运行".to_string()
         };
+        let text = if let Some(v) = &self.update_version {
+            format!("{text} · 新版本 v{v}")
+        } else {
+            text
+        };
         let _ = self.tray.set_tooltip(Some(&text));
     }
 
     /// "打开"处理：dsh 已运行则直接打开；
     /// 未运行则登记待办并立即让扫描灯流动，由守护线程拉起，就绪后自动打开。
-    fn handle_open(&self) {
+    fn handle_open(&mut self) {
         if dsh::port_ready() {
             let _ = dsh::open_page();
         } else {
@@ -251,6 +273,66 @@ impl App {
             // 与动画同款即时反馈：tooltip 立即显示"启动中"
             self.update_tooltip(false, true);
             log::info("dsh 未运行：登记打开待办，由 watchdog 拉起后就绪自动打开");
+        }
+    }
+
+    /// 更新检测线程：启动 30 秒后首查 (避开 dsh 拉起网络繁忙期)，之后每 24 小时复查；
+    /// "检查更新"菜单置位 update_check 时立即检查
+    fn spawn_checker(&self) {
+        let proxy = self.proxy.clone();
+        let check_now = self.update_check.clone();
+        let quitting = self.quitting.clone();
+        update::spawn_checker(check_now, quitting, move |manual, result| {
+            let _ = proxy.send_event(UserEvent::UpdateChecked { result, manual });
+        });
+    }
+
+    /// "检查更新"菜单：已知新版 → 打开发布页；否则触发一次异步检查
+    fn handle_update_click(&self) {
+        if let Some(url) = &self.update_url {
+            log::info(&format!("打开更新页面：{url}"));
+            if let Err(e) = dsh::open_url(url) {
+                log::error(&format!("打开更新页面失败：{e}"));
+            }
+        } else {
+            self.update_item.set_text("检查中…");
+            self.update_check.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// 应用更新检测结果：更新菜单文本与 tooltip 提示。
+    /// 自动检查失败静默 (仅记日志)；手动检查的失败/无新版通过菜单文本反馈。
+    fn apply_update_result(
+        &mut self,
+        result: Result<Option<update::UpdateInfo>, ()>,
+        manual: bool,
+    ) {
+        match result {
+            Ok(Some(info)) => {
+                log::info(&format!("发现新版本 v{}", info.version));
+                self.update_version = Some(info.version.clone());
+                self.update_url = Some(info.url.clone());
+                self.update_item
+                    .set_text(format!("更新到 v{}", info.version));
+                self.update_tooltip(self.tooltip_ready, self.starting.load(Ordering::SeqCst));
+            }
+            Ok(None) => {
+                if manual {
+                    self.update_item.set_text("已是最新版本");
+                    log::info(&format!(
+                        "手动检查更新：已是最新版本 v{}",
+                        update::local_version()
+                    ));
+                }
+            }
+            Err(()) => {
+                if manual {
+                    self.update_item.set_text("检查失败，点击重试");
+                    log::warn("手动检查更新失败：所有更新源不可达");
+                } else {
+                    log::info("自动更新检测失败 (网络不可达)，静默忽略");
+                }
+            }
         }
     }
 
@@ -308,6 +390,9 @@ impl ApplicationHandler<UserEvent> for App {
                     // 与动画同款即时反馈：tooltip 立即显示"启动中"
                     self.update_tooltip(false, true);
                     thread::spawn(dsh::stop_harness);
+                } else if ev.id() == &self.update_id {
+                    // 检查更新：已知新版打开发布页；否则触发异步检查
+                    self.handle_update_click();
                 } else if ev.id() == &self.quit_id {
                     // 退出：终结 dsh 并停止守护后退出本程序
                     self.handle_quit(event_loop);
@@ -356,6 +441,9 @@ impl ApplicationHandler<UserEvent> for App {
                 // 实时读 starting：事件到达时若 flow 已结束则显示最终状态，
                 // 避免竞态 (watchdog 事件与 AnimationDone 乱序) 导致 tooltip 卡"启动中"
                 self.update_tooltip(ready, self.starting.load(Ordering::SeqCst));
+            }
+            UserEvent::UpdateChecked { result, manual } => {
+                self.apply_update_result(result, manual);
             }
         }
     }
@@ -439,13 +527,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     let open_item = MenuItem::new("打开", true, None);
     let config_item = MenuItem::new("配置", true, None);
     let restart_item = MenuItem::new("重启", true, None);
+    let update_item = MenuItem::new("检查更新", true, None);
     let quit_item = MenuItem::new("退出", true, None);
-    menu.append_items(&[&open_item, &config_item, &restart_item, &quit_item])?;
+    menu.append_items(&[
+        &open_item,
+        &config_item,
+        &restart_item,
+        &update_item,
+        &quit_item,
+    ])?;
 
     // 记录菜单项 id，用于事件分发
     let open_id = open_item.id().clone();
     let config_id = config_item.id().clone();
     let restart_id = restart_item.id().clone();
+    let update_id = update_item.id().clone();
     let quit_id = quit_item.id().clone();
 
     // 事件循环 (不创建任何窗口，仅承载托盘事件)
@@ -487,6 +583,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         config_id,
         restart_id,
         quit_id,
+        update_item,
+        update_id,
+        update_check: Arc::new(AtomicBool::new(false)),
+        update_version: None,
+        update_url: None,
+        tooltip_ready: false,
     };
 
     // 程序启动即让扫描灯流动；watchdog 首轮探测到 dsh 就绪后自动停止
@@ -494,6 +596,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // 动画线程 + 守护线程
     app.spawn_animator();
     app.spawn_watchdog();
+    app.spawn_checker();
 
     event_loop.run_app(&mut app)?;
 
