@@ -9,10 +9,11 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 - 启动命令：`npx -y @deepseek-ai/dsh web` (后台隐藏窗口，端口覆盖时附加 --port)
 - 技术栈：Rust 1.97 / tray-icon 0.19 / winit 0.30 / image 0.25 (仅 ico 特性) / windows 0.61 (WinRT toast) / windows-sys 0.59
 - 目录结构：
-  - `src/main.rs`：托盘、菜单、watchdog、启动流程、动画；启动失败与 panic 写入 launcher.log (windows_subsystem 无控制台)
-  - `src/dsh.rs`：dsh 进程控制 (启动/停止/端口探测)、ShellExecuteW、纯 Win32 进程树清理、单实例
-  - `src/log.rs`：单文件日志 `launcher.log` (启动器事件 + dsh 输出 `[DSH]`，按行时间标签 + 凌晨 4 点日界，保留 3 天；超过 10 MiB 按行截断到 8 MiB 内；写入/查询/清理全部由后台日志管理线程串行处理，其它线程只投递消息队列)
+  - `src/main.rs`：托盘、菜单、watchdog、启动流程、动画；启动失败与 panic 写入 launcher.log (windows_subsystem 无控制台)；watchdog/动画循环逐次 catch_unwind，异常后继续服务
+  - `src/dsh.rs`：dsh 进程控制 (启动/停止/端口探测)、ShellExecuteW、纯 Win32 进程树清理、单实例；兜底清理用完整镜像路径 + 命令行确认 dsh 身份
+  - `src/log.rs`：单文件日志 `launcher.log` (启动器事件 + dsh 输出 `[DSH]`，按行时间标签 + 凌晨 4 点日界，保留 3 天；超过 10 MiB 按行截断到 8 MiB 内；写入/查询/清理全部由后台日志管理线程串行处理，其它线程只投递消息队列；单条消息处理异常后线程继续)
   - `src/toast.rs`：直接通过 WinRT 发送更新 toast，并登记自有 AUMID (不再启动 PowerShell)
+  - `src/update.rs`：版本更新检测 (GitHub Releases API + 镜像、WinHTTP、toast 去重)；检测循环逐次 catch_unwind
   - `build.rs`：把 icons 下的 ICO 嵌入 PE 资源 (桌面 exe 图标)
   - `tests/doc_language.rs`：扫描文档与源码注释，禁止过程性表述与历史依据用语
   - `icons/`：DeepSeekHarness-WhaleGirl.ico (256x256，唯一图标源)
@@ -75,6 +76,8 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 - `runtime_source_has_no_shell_proxies`：扫描源码，禁止 `Command::new("powershell.exe")` / `netstat.exe` / `taskkill.exe` 与 `-EncodedCommand`。
 - `docs_and_source_have_no_process_language`：扫描 README/build.rs/src/CI/Cargo.toml，禁止过程性表述与历史依据用语 (AGENTS.md 除外)。
 - `listener_pids_finds_current_process`：真实 `TcpListener` 验证端口 → PID。
+- `process_full_image_name_finds_current_process`：验证 `QueryFullProcessImageNameW` 完整镜像路径查询。
+- `process_command_line_reads_dsh_marker_from_child_process`：真实 spawn 子进程并读取命令行中的 `@deepseek-ai/dsh` 标记。
 - `kill_process_tree_terminates_child_process`：真实 spawn 子进程并终止。
 - `resume_process_main_thread_starts_suspended_process`：真实 spawn 挂起进程并恢复主线程。
 - `truncate_log_from_head_*`：验证按大小截断保留尾部完整行。
@@ -101,7 +104,8 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 
 ### 守护线程 (App::spawn_watchdog)
 - 每 2 秒探测 dsh 端口；连续拉起失败 3 次后放慢到 30 秒
-- dsh 未运行且无启动流程 → `spawn_startup_flow(proxy, starting, quitting, anim_running)` (含清理残留)
+- 单次检查在 catch_unwind 内执行：异常时写日志、重读 `was_ready`、置动画开关为运行，并在 2 秒后继续，守护线程本身不退
+- dsh 未运行且无启动流程 → `spawn_startup_flow(proxy, starting, quitting, anim_running)` (含清理残留)；启动流程线程用 `thread::Builder::spawn` 创建，创建失败时立即释放 `starting`
 - 启动器启动时 dsh 已在运行 (端口连通) → 直接复用，不杀不重启
 
 ### 启动流程 (spawn_startup_flow)
@@ -145,15 +149,16 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 ### windows-sys 0.59 要点
 - 项目统一用 `to_wide()` 生成带终止符的 UTF-16 `Vec<u16>`，传参用 `.as_ptr()`；`CreateMutexW` 等 Win32 API 直接接收该指针
 - `CreateMutexW` 被 `cfg(feature = "Win32_Security")` 门控；`ShellExecuteW` 需要 feature `Win32_UI_Shell`
-- Cargo.toml features：`Win32_Foundation` + `Win32_System_Threading` + `Win32_Security` + `Win32_UI_Shell` + `Win32_System_JobObjects` + `Win32_System_SystemInformation` + `Win32_System_Registry` + `Win32_UI_WindowsAndMessaging` + `Win32_NetworkManagement_IpHelper` + `Win32_System_Diagnostics_ToolHelp` + `Win32_Networking_WinSock` + `Win32_Networking_WinHttp`
+- Cargo.toml features：`Win32_Foundation` + `Win32_System_Threading` + `Win32_Security` + `Win32_UI_Shell` + `Win32_System_JobObjects` + `Win32_System_SystemInformation` + `Win32_System_Registry` + `Win32_UI_WindowsAndMessaging` + `Win32_NetworkManagement_IpHelper` + `Win32_System_Diagnostics_ToolHelp` + `Win32_System_Diagnostics_Debug` + `Win32_Networking_WinSock` + `Win32_Networking_WinHttp` + `Wdk_System_Threading`
 - `image` 依赖关闭默认特性，只启用 `ico` (内含 bmp/png 支持)，减小构建依赖面
 - `ShellExecuteW` 返回 HINSTANCE，`as isize > 32` 表示成功 (打开 URL 无黑框，替代 cmd start)
 
 ### 纯 Win32 兜底清理 (dsh.rs)
 - 更新 toast 已由 `src/toast.rs` 直接 WinRT 发送；停止 dsh 的兜底路径也已去掉 PowerShell/Base64
 - 找监听 PID：`GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL)`，IPv4 端口以网络字节序比较 (`u16::from_be`)
-- 清理进程树：`CreateToolhelp32Snapshot` + `Process32First/Next` 建立父子关系 → 先子后父 `OpenProcess(PROCESS_TERMINATE)` + `TerminateProcess`
-- 该路径由 `listener_pids_finds_current_process` 单测覆盖端口/PID 查找
+- 监听进程身份确认：Toolhelp 先取 exe 名，命中 node/cmd/dsh/npx 后用 `QueryFullProcessImageNameW` 取完整镜像路径，并用 `NtQueryInformationProcess(ProcessBasicInformation)` + PEB 读取命令行；node/npx/cmd 的命令行必须包含 `@deepseek-ai/dsh` (兼容 `/` 与 `\` 分隔符)，dsh.exe 按镜像名确认；名称命中但身份未确认的进程跳过，快照中查不到名称时仍保守清理；跨 32/64 位进程时不读命令行，按未确认处理
+- 清理进程树：`CreateToolhelp32Snapshot` + `Process32First/Next` 建立父子关系 → 先子后父 `OpenProcess(PROCESS_TERMINATE)` + `TerminateProcess`；祖先链同样只终止通过身份确认的父进程
+- 该路径由 `listener_pids_finds_current_process` 单测覆盖端口/PID 查找；`process_command_line_reads_dsh_marker_from_child_process` 真实 spawn 子进程覆盖命令行读取
 - 端口 `DSHLAUNCHER_PORT` 环境变量可覆盖默认 3080
 
 ### dsh 启动与输出日志 (dsh.rs)

@@ -10,6 +10,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender, SyncSender};
 use std::sync::OnceLock;
@@ -50,11 +51,12 @@ fn log_tx() -> Sender<LogCommand> {
 }
 
 /// 日志管理线程：串行执行清理与追加写入；查询在写入之间完成。
-/// 同一时刻只有该线程访问日志文件。
+/// 同一时刻只有该线程访问日志文件。单条消息处理异常时写内部错误后继续，
+/// 避免日志线程退出导致全部日志静默丢失。
 fn log_loop(rx: mpsc::Receiver<LogCommand>) {
     let mut last_cleanup_day: Option<(i64, u32, u32)> = None;
     while let Ok(cmd) = rx.recv() {
-        match cmd {
+        let result = catch_unwind(AssertUnwindSafe(|| match cmd {
             LogCommand::Write { level, msg } => {
                 cleanup_if_day_changed(&mut last_cleanup_day);
                 append_line(level, &msg);
@@ -65,6 +67,9 @@ fn log_loop(rx: mpsc::Receiver<LogCommand>) {
             LogCommand::Flush { reply } => {
                 let _ = reply.send(());
             }
+        }));
+        if result.is_err() {
+            log_internal_error("日志管理线程处理消息异常，继续服务后续消息");
         }
     }
 }

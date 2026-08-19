@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS,
     HANDLE, INVALID_HANDLE_VALUE,
@@ -18,6 +19,7 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, MIB_TCPTABLE_OWNER_PID, MIB_TCP_STATE_LISTEN, TCP_TABLE_OWNER_PID_ALL,
 };
 use windows_sys::Win32::Networking::WinSock::AF_INET;
+use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, Thread32First, Thread32Next,
     PROCESSENTRY32W, TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD, THREADENTRY32,
@@ -28,8 +30,10 @@ use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateMutexW, OpenProcess, OpenThread, ResumeThread, TerminateProcess, CREATE_NO_WINDOW,
-    CREATE_SUSPENDED, IO_COUNTERS, PROCESS_TERMINATE, THREAD_SUSPEND_RESUME,
+    CreateMutexW, IsWow64Process, OpenProcess, OpenThread, QueryFullProcessImageNameW,
+    ResumeThread, TerminateProcess, CREATE_NO_WINDOW, CREATE_SUSPENDED, IO_COUNTERS,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, PROCESS_VM_READ,
+    THREAD_SUSPEND_RESUME,
 };
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -193,6 +197,167 @@ fn job_handle() -> Option<HANDLE> {
     }
 }
 
+/// 进程查询句柄：持有 OpenProcess 返回的 HANDLE，并在离开作用域时关闭。
+struct ProcessHandle(HANDLE);
+
+impl ProcessHandle {
+    fn open(pid: u32, access: u32) -> Option<Self> {
+        unsafe {
+            let handle = OpenProcess(access, 0, pid);
+            if handle.is_null() {
+                None
+            } else {
+                Some(Self(handle))
+            }
+        }
+    }
+
+    /// 从目标进程地址空间读取一块内存；要求读满整个缓冲区。
+    fn read_memory(&self, address: usize, buffer: &mut [u8]) -> bool {
+        unsafe {
+            let mut read = 0usize;
+            ReadProcessMemory(
+                self.0,
+                address as *const core::ffi::c_void,
+                buffer.as_mut_ptr() as *mut core::ffi::c_void,
+                buffer.len(),
+                &mut read,
+            ) != 0
+                && read == buffer.len()
+        }
+    }
+
+    fn read_pointer(&self, address: usize) -> Option<usize> {
+        let mut bytes = [0u8; std::mem::size_of::<usize>()];
+        if !self.read_memory(address, &mut bytes) {
+            return None;
+        }
+        Some(usize::from_ne_bytes(bytes))
+    }
+
+    fn read_u16(&self, address: usize) -> Option<u16> {
+        let mut bytes = [0u8; 2];
+        if !self.read_memory(address, &mut bytes) {
+            return None;
+        }
+        Some(u16::from_ne_bytes(bytes))
+    }
+
+    /// QueryFullProcessImageNameW 读取 Win32 路径；缓冲区不足时按返回长度扩大重试。
+    fn full_image_name(&self) -> Option<String> {
+        let mut capacity = 512usize;
+        for _ in 0..4 {
+            let mut buffer = vec![0u16; capacity];
+            let mut length = buffer.len() as u32;
+            let ok = unsafe {
+                QueryFullProcessImageNameW(
+                    self.0,
+                    PROCESS_NAME_WIN32,
+                    buffer.as_mut_ptr(),
+                    &mut length,
+                )
+            };
+            if ok != 0 {
+                return String::from_utf16(&buffer[..length as usize]).ok();
+            }
+            if length as usize <= capacity {
+                return None;
+            }
+            capacity = length as usize;
+        }
+        None
+    }
+
+    /// 目标进程的指针宽度：WOW64 目标按 4 字节，其它目标按本进程宽度。
+    /// 指针宽度与本进程不一致时，command_line 不读取。
+    fn remote_pointer_size(&self) -> Option<usize> {
+        let mut wow64 = 0i32;
+        let ok = unsafe { IsWow64Process(self.0, &mut wow64) };
+        if ok == 0 {
+            return Some(std::mem::size_of::<usize>());
+        }
+        Some(if wow64 != 0 {
+            4
+        } else {
+            std::mem::size_of::<usize>()
+        })
+    }
+
+    /// NtQueryInformationProcess 读取 ProcessBasicInformation。
+    fn process_basic_info(&self) -> Option<ProcessBasicInfoRaw> {
+        let mut info = ProcessBasicInfoRaw::zeroed();
+        let mut returned = 0u32;
+        let status = unsafe {
+            NtQueryInformationProcess(
+                self.0,
+                ProcessBasicInformation,
+                &mut info as *mut ProcessBasicInfoRaw as *mut core::ffi::c_void,
+                std::mem::size_of::<ProcessBasicInfoRaw>() as u32,
+                &mut returned,
+            )
+        };
+        if status < 0 {
+            None
+        } else {
+            Some(info)
+        }
+    }
+
+    /// 读取目标进程命令行：ProcessBasicInformation → PEB.ProcessParameters →
+    /// RTL_USER_PROCESS_PARAMETERS.CommandLine。跨 32/64 位进程时不读取。
+    fn command_line(&self) -> Option<String> {
+        let pointer_size = self.remote_pointer_size()?;
+        if pointer_size != std::mem::size_of::<usize>() {
+            return None;
+        }
+        let info = self.process_basic_info()?;
+        let peb = info.peb_base_address;
+        let params_ptr = self.read_pointer(peb + if pointer_size == 8 { 0x20 } else { 0x10 })?;
+        let command_desc = params_ptr + if pointer_size == 8 { 0x70 } else { 0x40 };
+        let length = self.read_u16(command_desc)? as usize;
+        if length == 0 || !length.is_multiple_of(2) {
+            return None;
+        }
+        let chars = length / 2;
+        if chars > 32768 {
+            return None;
+        }
+        let buffer_ptr = self.read_pointer(command_desc + if pointer_size == 8 { 8 } else { 4 })?;
+        let mut text = vec![0u16; chars];
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(text.as_mut_ptr() as *mut u8, chars * 2) };
+        if !self.read_memory(buffer_ptr, bytes) {
+            return None;
+        }
+        String::from_utf16(&text).ok()
+    }
+}
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+/// PROCESS_BASIC_INFORMATION 的本地布局 (仅用于取 PebBaseAddress)。
+#[repr(C)]
+struct ProcessBasicInfoRaw {
+    exit_status: i32,
+    peb_base_address: usize,
+    affinity_mask: usize,
+    base_priority: i32,
+    unique_process_id: usize,
+    inherited_from_unique_process_id: usize,
+}
+
+impl ProcessBasicInfoRaw {
+    fn zeroed() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
 /// 用系统默认方式 (ShellExecuteW) 打开目标 (URL / 文件 / 目录)，不产生任何控制台窗口
 fn shell_execute_open(target: &str) -> io::Result<()> {
     let target_wide = to_wide(target);
@@ -306,8 +471,17 @@ fn process_snapshot() -> Vec<(u32, u32)> {
     }
 }
 
-/// 枚举进程快照并附带小写可执行文件名，用于清理前识别占用端口的是否为 dsh 进程。
-fn process_snapshot_with_names() -> Vec<(u32, u32, String)> {
+/// 进程快照条目：pid、父 pid、小写 exe 名与 dsh 身份确认结果。
+struct NamedProcess {
+    pid: u32,
+    parent_pid: u32,
+    exe_name: String,
+    confirmed_dsh: bool,
+}
+
+/// 枚举进程快照并附带 exe 名与 dsh 身份确认结果，用于清理前识别占用端口的进程。
+/// 只有名称命中白名单的条目才执行完整路径与命令行查询，避免为无关进程支付查询开销。
+fn process_snapshot_with_names() -> Vec<NamedProcess> {
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snapshot == INVALID_HANDLE_VALUE {
@@ -318,11 +492,15 @@ fn process_snapshot_with_names() -> Vec<(u32, u32, String)> {
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
         if Process32FirstW(snapshot, &mut entry) != 0 {
             loop {
-                out.push((
-                    entry.th32ProcessID,
-                    entry.th32ParentProcessID,
-                    process_entry_exe_name(&entry),
-                ));
+                let exe_name = process_entry_exe_name(&entry);
+                let confirmed_dsh = is_dsh_process_name(&exe_name)
+                    && confirm_dsh_process(entry.th32ProcessID, &exe_name);
+                out.push(NamedProcess {
+                    pid: entry.th32ProcessID,
+                    parent_pid: entry.th32ParentProcessID,
+                    exe_name,
+                    confirmed_dsh,
+                });
                 entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
                 if Process32NextW(snapshot, &mut entry) == 0 {
                     break;
@@ -345,10 +523,55 @@ fn process_entry_exe_name(entry: &PROCESSENTRY32W) -> String {
 }
 
 /// dsh 由 `cmd.exe /c npx ...` 启动，最终监听者通常是 node.exe；
-/// 外部残留也可能直接是 cmd/dsh。只有这些已知名称才允许兜底整树终止，
-/// 避免 DSHLAUNCHER_PORT 误配到无关服务时误杀。
+/// 外部残留也可能直接是 cmd/dsh。只有这些已知名称才允许进入身份确认流程。
 fn is_dsh_process_name(exe_name: &str) -> bool {
     matches!(exe_name, "node.exe" | "cmd.exe" | "dsh.exe" | "npx.exe")
+}
+
+/// 读取目标进程的完整镜像路径 (QueryFullProcessImageNameW)。
+fn process_full_image_name(pid: u32) -> Option<String> {
+    ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?.full_image_name()
+}
+
+/// 读取目标进程的命令行 (NtQueryInformationProcess → PEB → RTL_USER_PROCESS_PARAMETERS)。
+fn process_command_line(pid: u32) -> Option<String> {
+    ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)?.command_line()
+}
+
+/// 确认一个已知名称的监听进程确实属于 dsh：
+/// - 完整镜像文件名必须仍命中白名单；
+/// - node/npx/cmd 的命令行必须包含 @deepseek-ai/dsh (兼容路径分隔符)；
+/// - dsh.exe 名称本身足够具体，按镜像名确认。
+fn dsh_identity_confirmed(
+    exe_name: &str,
+    image_path: Option<&str>,
+    command_line: Option<&str>,
+) -> bool {
+    let file_name = image_path
+        .and_then(|path| Path::new(path).file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or(exe_name)
+        .to_lowercase();
+    if !is_dsh_process_name(&file_name) {
+        return false;
+    }
+    if file_name == "dsh.exe" {
+        return true;
+    }
+    command_line.is_some_and(command_line_mentions_dsh)
+}
+
+/// 命令行中是否出现 @deepseek-ai/dsh；Windows 的 node 路径分隔符按反斜杠一并识别。
+fn command_line_mentions_dsh(command_line: &str) -> bool {
+    let command_line = command_line.to_lowercase();
+    command_line.contains("@deepseek-ai/dsh") || command_line.contains(r"@deepseek-ai\dsh")
+}
+
+/// 汇总完整路径与命令行证据，确认监听进程属于 dsh。
+fn confirm_dsh_process(pid: u32, exe_name: &str) -> bool {
+    let image_path = process_full_image_name(pid);
+    let command_line = process_command_line(pid);
+    dsh_identity_confirmed(exe_name, image_path.as_deref(), command_line.as_deref())
 }
 
 /// 恢复挂起进程的主线程：通过线程快照找到该进程的线程并 ResumeThread。
@@ -385,27 +608,28 @@ fn resume_process_main_thread(pid: u32) -> bool {
     false
 }
 
-/// 收集监听进程向上连续命中的 dsh 已知祖先 (典型链路 node → npx → cmd)。
-/// 只返回链上逐级父进程，不涉及祖先的其它子进程。
-fn collect_known_ancestors(pid: u32, processes: &[(u32, u32, String)]) -> Vec<u32> {
+/// 收集监听进程向上连续命中的 dsh 祖先 (典型链路 node → npx → cmd)。
+/// 只返回链上逐级父进程，不涉及祖先的其它子进程；父进程必须同样通过身份确认。
+fn collect_known_ancestors(pid: u32, processes: &[NamedProcess]) -> Vec<u32> {
     let mut ancestors = Vec::new();
     let mut current = pid;
-    while let Some((_, parent, _)) = processes.iter().find(|(id, _, _)| *id == current) {
-        let Some((_, _, parent_name)) = processes.iter().find(|(id, _, _)| id == parent) else {
+    while let Some(entry) = processes.iter().find(|entry| entry.pid == current) {
+        let parent = entry.parent_pid;
+        let Some(parent_entry) = processes.iter().find(|entry| entry.pid == parent) else {
             break;
         };
-        if *parent == 0 || !is_dsh_process_name(parent_name) || ancestors.contains(parent) {
+        if parent == 0 || !parent_entry.confirmed_dsh || ancestors.contains(&parent) {
             break;
         }
-        ancestors.push(*parent);
-        current = *parent;
+        ancestors.push(parent);
+        current = parent;
     }
     ancestors
 }
 
-/// 终止监听进程的 dsh 已知祖先链 (仅在监听者不是 cmd.exe 时使用，
+/// 终止监听进程的 dsh 祖先链 (仅在监听者不是 cmd.exe 时使用，
 /// 避免误伤 cmd 监听者更上层的命令行解释器)。
-fn kill_known_ancestors(pid: u32, processes: &[(u32, u32, String)]) {
+fn kill_known_ancestors(pid: u32, processes: &[NamedProcess]) {
     for ancestor in collect_known_ancestors(pid, processes) {
         let _ = terminate_pid(ancestor);
     }
@@ -472,24 +696,28 @@ pub fn stop_harness() {
             return;
         }
 
-        // 先识别监听进程名称，只终止已知的 dsh 进程树；
-        // 快照中查不到名称时保守清理 (权限不足时优先保证 dsh 不残留)。
+        // 监听进程先按 exe 名过滤，再用完整镜像路径与命令行确认 dsh 身份；
+        // 名称命中但身份未确认的进程跳过，避免误杀同名无关服务。
+        // 快照中完全查不到名称时保守清理 (权限不足时优先保证 dsh 不残留)。
         let named = process_snapshot_with_names();
         let mut roots = Vec::new();
         let mut ancestor_roots = Vec::new();
         let mut skipped = Vec::new();
         for &pid in &pids {
-            match named.iter().find(|(id, _, _)| *id == pid) {
-                Some((_, _, name)) if !is_dsh_process_name(name) => {
-                    skipped.push((pid, name.clone()));
+            match named.iter().find(|entry| entry.pid == pid) {
+                Some(entry) if !is_dsh_process_name(&entry.exe_name) => {
+                    skipped.push((pid, entry.exe_name.clone()));
                 }
-                Some((_, _, name)) => {
+                Some(entry) if entry.confirmed_dsh => {
                     roots.push(pid);
                     // node/npx/dsh 监听者的上层 cmd/npx 包装进程在兜底路径中一并终止；
                     // 监听者本身是 cmd 时不向上追溯，避免误伤无关的命令行解释器。
-                    if name != "cmd.exe" {
+                    if entry.exe_name != "cmd.exe" {
                         ancestor_roots.push(pid);
                     }
+                }
+                Some(entry) => {
+                    skipped.push((pid, format!("{} (未确认 dsh 命令行)", entry.exe_name)))
                 }
                 None => roots.push(pid),
             }
@@ -747,22 +975,43 @@ mod tests {
         assert!(activity.elapsed() < Duration::from_secs(1));
     }
 
+    fn named_process(
+        pid: u32,
+        parent_pid: u32,
+        exe_name: &str,
+        confirmed_dsh: bool,
+    ) -> NamedProcess {
+        NamedProcess {
+            pid,
+            parent_pid,
+            exe_name: exe_name.to_string(),
+            confirmed_dsh,
+        }
+    }
+
     #[test]
     fn collect_known_ancestors_stops_at_non_dsh_process() {
         let processes = vec![
-            (10, 3, "node.exe".to_string()),
-            (3, 2, "npx.exe".to_string()),
-            (2, 1, "cmd.exe".to_string()),
-            (1, 0, "explorer.exe".to_string()),
+            named_process(10, 3, "node.exe", true),
+            named_process(3, 2, "npx.exe", true),
+            named_process(2, 1, "cmd.exe", true),
+            named_process(1, 0, "explorer.exe", false),
         ];
         assert_eq!(collect_known_ancestors(10, &processes), vec![3, 2]);
 
         let unrelated = vec![
-            (20, 5, "node.exe".to_string()),
-            (5, 4, "explorer.exe".to_string()),
-            (4, 0, "explorer.exe".to_string()),
+            named_process(20, 5, "node.exe", true),
+            named_process(5, 4, "explorer.exe", false),
+            named_process(4, 0, "explorer.exe", false),
         ];
         assert!(collect_known_ancestors(20, &unrelated).is_empty());
+
+        let unconfirmed_parent = vec![
+            named_process(30, 6, "node.exe", true),
+            named_process(6, 7, "cmd.exe", false),
+            named_process(7, 0, "explorer.exe", false),
+        ];
+        assert!(collect_known_ancestors(30, &unconfirmed_parent).is_empty());
     }
 
     #[test]
@@ -868,6 +1117,97 @@ mod tests {
         assert!(is_dsh_process_name("npx.exe"));
         assert!(!is_dsh_process_name("svchost.exe"));
         assert!(!is_dsh_process_name("python.exe"));
+    }
+
+    #[test]
+    fn dsh_identity_confirmed_requires_command_line_marker() {
+        let node_exe = Some(r"C:\Program Files\nodejs\node.exe");
+        let cmd_exe = Some(r"C:\Windows\System32\cmd.exe");
+        let dsh_exe = Some(r"C:\Program Files\dsh\dsh.exe");
+
+        assert!(dsh_identity_confirmed(
+            "node.exe",
+            node_exe,
+            Some(r#""node" "C:\Users\u\node_modules\@deepseek-ai\dsh\cli.js""#)
+        ));
+        assert!(dsh_identity_confirmed(
+            "node.exe",
+            node_exe,
+            Some(r#""node" "C:\Users\u\node_modules\@deepseek-ai/dsh/cli.js""#)
+        ));
+        assert!(!dsh_identity_confirmed(
+            "node.exe",
+            node_exe,
+            Some("node server.js")
+        ));
+        assert!(!dsh_identity_confirmed("node.exe", node_exe, None));
+
+        assert!(dsh_identity_confirmed(
+            "cmd.exe",
+            cmd_exe,
+            Some(r"C:\Windows\System32\cmd.exe /c npx -y @deepseek-ai/dsh web")
+        ));
+        assert!(!dsh_identity_confirmed(
+            "cmd.exe",
+            cmd_exe,
+            Some(r"C:\Windows\System32\cmd.exe /c dir")
+        ));
+
+        assert!(dsh_identity_confirmed("dsh.exe", dsh_exe, None));
+        assert!(!dsh_identity_confirmed(
+            "node.exe",
+            Some(r"C:\Windows\System32\notepad.exe"),
+            Some("@deepseek-ai/dsh")
+        ));
+    }
+
+    #[test]
+    fn process_full_image_name_finds_current_process() {
+        let image =
+            process_full_image_name(std::process::id()).expect("应能读取当前进程的完整镜像路径");
+        assert!(
+            Path::new(&image).is_absolute(),
+            "镜像路径应为绝对路径：{image}"
+        );
+        assert!(
+            image.to_lowercase().ends_with(".exe"),
+            "镜像路径应以 .exe 结尾：{image}"
+        );
+    }
+
+    #[test]
+    fn process_command_line_reads_dsh_marker_from_child_process() {
+        let mut child = Command::new("cmd.exe")
+            .args(["/c", "echo @deepseek-ai/dsh & ping -n 10 127.0.0.1 >nul"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let command_line = loop {
+            if let Some(command_line) = process_command_line(child.id()) {
+                break command_line;
+            }
+            if child.try_wait().ok().flatten().is_some() {
+                panic!("子进程在读取命令行前退出");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "未能在 5 秒内读取子进程命令行"
+            );
+            thread::sleep(Duration::from_millis(50));
+        };
+
+        assert!(
+            confirm_dsh_process(child.id(), "cmd.exe"),
+            "带 dsh 包标记的 cmd 子进程应通过身份确认"
+        );
+        kill_process_tree(&[child.id()]);
+        let _ = child.wait();
+        assert!(
+            command_line.to_lowercase().contains("@deepseek-ai/dsh"),
+            "子进程命令行应包含 dsh 包标记，实际：{command_line}"
+        );
     }
 
     #[test]

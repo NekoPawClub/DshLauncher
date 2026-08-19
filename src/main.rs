@@ -18,6 +18,8 @@ mod toast;
 mod update;
 
 use std::error::Error;
+use std::io;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -94,16 +96,19 @@ fn spawn_startup_flow(
     proxy: EventLoopProxy<UserEvent>,
     starting: Arc<AtomicBool>,
     quitting: Arc<AtomicBool>,
-) {
-    thread::spawn(move || {
-        // RAII 守卫：任何退出路径 (含 panic) 都会释放 starting。
-        // 正常结束时先显式释放，再发送 AnimationDone：
-        // 主线程处理事件时可读到实时 starting 状态，不会把旧流程误判为新流程。
-        let _guard = StartingGuard(starting.clone());
-        let ready = run_startup_flow(&proxy, &quitting);
-        drop(_guard);
-        let _ = proxy.send_event(UserEvent::AnimationDone { ready });
-    });
+) -> io::Result<()> {
+    thread::Builder::new()
+        .name("dsh-launcher-startup".to_string())
+        .spawn(move || {
+            // RAII 守卫：任何退出路径 (含 panic) 都会释放 starting。
+            // 正常结束时先显式释放，再发送 AnimationDone：
+            // 主线程处理事件时可读到实时 starting 状态，不会把旧流程误判为新流程。
+            let _guard = StartingGuard(starting.clone());
+            let ready = run_startup_flow(&proxy, &quitting);
+            drop(_guard);
+            let _ = proxy.send_event(UserEvent::AnimationDone { ready });
+        })?;
+    Ok(())
 }
 
 /// 启动流程主体：端口被占才清理 → 启动 → 等待就绪。返回最终是否就绪。
@@ -247,15 +252,23 @@ impl App {
                 if quitting.load(Ordering::SeqCst) {
                     break;
                 }
-                let running = anim_running.load(Ordering::SeqCst);
-                if !running && was_running {
-                    let _ = proxy.send_event(UserEvent::AnimationStop);
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    let running = anim_running.load(Ordering::SeqCst);
+                    if !running && was_running {
+                        let _ = proxy.send_event(UserEvent::AnimationStop);
+                    }
+                    was_running = running;
+                    if running {
+                        let _ = proxy.send_event(UserEvent::AnimationTick);
+                    }
+                    thread::sleep(Duration::from_millis(150));
+                }));
+                if result.is_err() {
+                    // 单次循环异常时重读开关，避免下降沿状态丢失。
+                    log::error("动画线程单次循环异常，150ms 后继续");
+                    was_running = anim_running.load(Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(150));
                 }
-                was_running = running;
-                if running {
-                    let _ = proxy.send_event(UserEvent::AnimationTick);
-                }
-                thread::sleep(Duration::from_millis(150));
             }
         });
     }
@@ -275,39 +288,55 @@ impl App {
                 if quitting.load(Ordering::SeqCst) {
                     break;
                 }
-                let ready = dsh::port_ready();
-                // 状态变化：驱动动画 (就绪停、未就绪跑)
-                if was_ready != Some(ready) {
-                    // 动画只由 watchdog 的“dsh 是否可连接”状态变化驱动：
-                    // 未就绪置 true，可连接置 false。
-                    set_anim(&anim_running, !ready);
-                    was_ready = Some(ready);
-                    // tooltip 同步运行状态 (flow 进行中时显示"启动中")
-                    let _ = proxy.send_event(UserEvent::TooltipUpdate { ready });
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    let ready = dsh::port_ready();
+                    // 状态变化：驱动动画 (就绪停、未就绪跑)
+                    if was_ready != Some(ready) {
+                        // 动画只由 watchdog 的“dsh 是否可连接”状态变化驱动：
+                        // 未就绪置 true，可连接置 false。
+                        set_anim(&anim_running, !ready);
+                        was_ready = Some(ready);
+                        // tooltip 同步运行状态 (flow 进行中时显示"启动中")
+                        let _ = proxy.send_event(UserEvent::TooltipUpdate { ready });
+                        if ready {
+                            log::info(&format!("dsh 就绪 (端口 {} 可连接)", dsh::web_port()));
+                        } else {
+                            log::info("dsh 未就绪");
+                        }
+                    }
                     if ready {
-                        log::info(&format!("dsh 就绪 (端口 {} 可连接)", dsh::web_port()));
+                        fail_count = 0;
+                    } else if !starting.swap(true, Ordering::SeqCst) {
+                        // dsh 未运行且无启动流程：保活拉起 (端口被占时 flow 内自动清理)
+                        log::info("dsh 未运行，触发保活拉起");
+                        match spawn_startup_flow(proxy.clone(), starting.clone(), quitting.clone())
+                        {
+                            Ok(()) => fail_count += 1,
+                            Err(e) => {
+                                starting.store(false, Ordering::SeqCst);
+                                log::error(&format!("启动流程线程创建失败：{e}"));
+                                fail_count += 1;
+                            }
+                        }
+                    }
+                    // 连续失败 3 次以上放慢到 30 秒一查
+                    let interval = if fail_count >= 3 {
+                        if fail_count == 3 {
+                            log::warn("连续拉起失败 3 次，轮询节奏放慢到 30 秒");
+                        }
+                        Duration::from_secs(30)
                     } else {
-                        log::info("dsh 未就绪");
-                    }
+                        Duration::from_secs(2)
+                    };
+                    thread::sleep(interval);
+                }));
+                if result.is_err() {
+                    // 单次检查异常时重读状态，下一轮强制同步动画与 tooltip。
+                    log::error("watchdog 单次检查异常，2 秒后继续");
+                    was_ready = None;
+                    set_anim(&anim_running, true);
+                    thread::sleep(Duration::from_secs(2));
                 }
-                if ready {
-                    fail_count = 0;
-                } else if !starting.swap(true, Ordering::SeqCst) {
-                    // dsh 未运行且无启动流程：保活拉起 (端口被占时 flow 内自动清理)
-                    log::info("dsh 未运行，触发保活拉起");
-                    spawn_startup_flow(proxy.clone(), starting.clone(), quitting.clone());
-                    fail_count += 1;
-                }
-                // 连续失败 3 次以上放慢到 30 秒一查
-                let interval = if fail_count >= 3 {
-                    if fail_count == 3 {
-                        log::warn("连续拉起失败 3 次，轮询节奏放慢到 30 秒");
-                    }
-                    Duration::from_secs(30)
-                } else {
-                    Duration::from_secs(2)
-                };
-                thread::sleep(interval);
             }
         });
     }

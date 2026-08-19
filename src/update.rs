@@ -13,6 +13,7 @@
 //! - 版本号 YY.MM.DD.NN 段长不固定：按 . 分段转数值逐段比较，不能字符串字典序
 //! - 响应仅提取 tag_name 字段，手工解析 JSON，不引入 serde
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -97,12 +98,17 @@ pub fn spawn_checker(quitting: Arc<AtomicBool>) {
             }
             if Instant::now() >= next {
                 next = Instant::now() + Duration::from_secs(60 * 60);
-                run_check(
-                    &mut last_written_remote,
-                    &mut last_written_day,
-                    &mut last_notified_remote,
-                    &mut notify_failed_version,
-                );
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    run_check(
+                        &mut last_written_remote,
+                        &mut last_written_day,
+                        &mut last_notified_remote,
+                        &mut notify_failed_version,
+                    );
+                }));
+                if result.is_err() {
+                    crate::log::error("更新检测单次检查异常，1 小时后重试");
+                }
             }
             thread::sleep(Duration::from_millis(1000));
         }

@@ -18,7 +18,7 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘启动器，使用 Rust 编写。
 - 左键单击无功能；左键双击等同“打开”
 - 保活细节：连续拉起失败 3 次后轮询节奏自动放慢 (2 秒 → 30 秒)，避免无效高频重试；退出时终结 dsh (Job 秒杀整个进程树，外部残留由纯 Win32 API 兜底清理)
 - **启动超时以 dsh 输出为心跳**：连续 120 秒没有任何输出才放弃本轮等待；只要 dsh 还在持续输出就不判超时，托盘 tooltip 会定期显示等待时长与输出状态
-- 外部残留兜底清理会先核对进程名 (node/cmd/dsh/npx)，不会因为端口配置错误而误杀无关服务
+- 外部残留兜底清理会先核对进程名 (node/cmd/dsh/npx)，并读取完整镜像路径与命令行：node/npx/cmd 必须在命令行中确认包含 `@deepseek-ai/dsh`，dsh.exe 按镜像名识别；无法确认身份的已知进程名会跳过，避免端口配置错误时误杀同名服务 (快照中查不到名称时仍保守清理)
 
 ## 构建
 
@@ -54,5 +54,5 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘启动器，使用 Rust 编写。
 - 托盘图标与可执行文件图标均来自 `icons/DeepSeekHarness-WhaleGirl.ico`
 - 图标来源：[deepseek-whale-girl-icon](https://github.com/fornarwhal/deepseek-whale-girl-icon.git)
 - 单实例：重复启动会自动退出
-- 运行日志：启动器事件与 dsh 输出统一写入 `%USERPROFILE%/.dsh/launcher.log` (单文件；启动器日志为 `[INFO]/[WARN]/[FAIL]`，dsh 的 stdout/stderr 按换行/缓冲块加时间标签与 `[DSH]` 标记；按每行时间标签保留最近 3 天，凌晨 4 点日界；单文件超过 10 MiB 后按行截断到 8 MiB 以内；更新检测与通知记录同样按普通日志清理；测试实例自动带后缀)；启动失败与线程 panic 也写入该日志；写入/查询/清理由后台日志管理线程串行执行，主线程只投递消息，不会被日志清理阻塞；可用环境变量 `DSHLAUNCHER_LOG_DIR` 覆盖日志目录
+- 运行日志：启动器事件与 dsh 输出统一写入 `%USERPROFILE%/.dsh/launcher.log` (单文件；启动器日志为 `[INFO]/[WARN]/[FAIL]`，dsh 的 stdout/stderr 按换行/缓冲块加时间标签与 `[DSH]` 标记；按每行时间标签保留最近 3 天，凌晨 4 点日界；单文件超过 10 MiB 后按行截断到 8 MiB 以内；更新检测与通知记录同样按普通日志清理；测试实例自动带后缀)；启动失败与线程 panic 也写入该日志；写入/查询/清理由后台日志管理线程串行执行，主线程只投递消息，不会被日志清理阻塞；watchdog、动画、更新检测与日志线程对单次循环异常做隔离，异常后继续服务；可用环境变量 `DSHLAUNCHER_LOG_DIR` 覆盖日志目录
 - 测试/多实例隔离：设置 `DSHLAUNCHER_INSTANCE` (trim 后只保留字母/数字/连字符/下划线) 可让测试实例使用独立互斥体与日志文件名，与正式实例共存
