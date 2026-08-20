@@ -522,7 +522,7 @@ pub fn info(msg: &str) {
 
 /// 记录一行 dsh 子进程输出 (stdout/stderr 合并写入 launcher.log)
 pub(crate) fn dsh_output(line: &str) {
-    write("DSH", line);
+    write(" DSH", line);
 }
 
 /// 记录一条 WARN 日志
@@ -693,7 +693,7 @@ mod tests {
         assert_eq!(version, "26.08.18.01");
         assert_eq!(day, (2026, 8, 17), "凌晨 4 点前应归前一天");
         assert!(parse_update_notify_line(
-            "2026-08-18 10:00:00 [DSH] [INFO] 更新通知成功：远端 v26.08.18.01"
+            "2026-08-18 10:00:00 [ DSH] [INFO] 更新通知成功：远端 v26.08.18.01"
         )
         .is_none());
         assert!(parse_update_notify_line(

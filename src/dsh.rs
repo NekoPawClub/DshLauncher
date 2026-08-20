@@ -740,7 +740,7 @@ pub fn stop_harness() {
 }
 
 /// 把 dsh 子进程的 stdout/stderr 写入 launcher.log。
-/// 子进程输出由日志模块统一加时间标签与 [DSH] 标记，并参与 3 天清理。
+/// 子进程输出由日志模块统一加时间标签与 [ DSH] 标记，并参与 3 天清理。
 /// 按读取块切分：遇到换行按行写入；没有换行也随块落盘，
 /// 同时保留未完成的 UTF-8 尾字节，避免多字节字符被块边界截断。
 fn pump_dsh_output<R: Read + Send + 'static>(mut reader: R, activity: Arc<OutputActivity>) {
@@ -823,7 +823,7 @@ fn kill_child_tree(child: &mut Child) {
 /// 后台隐藏窗口启动 dsh：npx @deepseek-ai/dsh web (工作目录为用户主目录)。
 /// 端口覆盖时透传 --port；-y 避免 npx 首次安装的交互确认。
 /// cmd/npx/node 的 stdout 与 stderr 由读取线程写入 launcher.log
-/// (时间标签 + [DSH] 标记)，与启动器日志合并于同一文件。
+/// (时间标签 + [ DSH] 标记)，与启动器日志合并于同一文件。
 /// cmd 以 CREATE_SUSPENDED 创建：先挂入全局 Job (KILL_ON_JOB_CLOSE)，
 /// 恢复主线程后才开始执行，因此不存在 cmd 在挂接前派生 npx/node 的窗口；
 /// 挂接与恢复之间检查退出请求，失败路径清理整棵进程树。
@@ -893,9 +893,7 @@ pub fn start_harness(quitting: &AtomicBool, activity: Arc<OutputActivity>) -> io
     pump_dsh_output(stdout, activity.clone());
     pump_dsh_output(stderr, activity);
 
-    crate::log::info(&format!(
-        "已启动 dsh ({web_cmd}) 并挂入 Job，输出已并入 launcher.log"
-    ));
+    crate::log::info(&format!("已启动 dsh ({web_cmd}) 并挂入 Job"));
     Ok(())
 }
 

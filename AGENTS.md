@@ -11,7 +11,7 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 - 目录结构：
   - `src/main.rs`：托盘、菜单、watchdog、启动流程、动画；启动失败与 panic 写入 launcher.log (windows_subsystem 无控制台)；watchdog/动画循环逐次 catch_unwind，异常后继续服务
   - `src/dsh.rs`：dsh 进程控制 (启动/停止/端口探测)、ShellExecuteW、纯 Win32 进程树清理、单实例；兜底清理用完整镜像路径 + 命令行确认 dsh 身份
-  - `src/log.rs`：单文件日志 `launcher.log` (启动器事件 + dsh 输出 `[DSH]`，按行时间标签 + 凌晨 4 点日界，保留 3 天；超过 10 MiB 按行截断到 8 MiB 内；写入/查询/清理全部由后台日志管理线程串行处理，其它线程只投递消息队列；单条消息处理异常后线程继续)
+  - `src/log.rs`：单文件日志 `launcher.log` (启动器事件 + dsh 输出 `[ DSH]`，按行时间标签 + 凌晨 4 点日界，保留 3 天；超过 10 MiB 按行截断到 8 MiB 内；写入/查询/清理全部由后台日志管理线程串行处理，其它线程只投递消息队列；单条消息处理异常后线程继续)
   - `src/toast.rs`：直接通过 WinRT 发送更新 toast，并登记自有 AUMID (不再启动 PowerShell)
   - `src/update.rs`：版本更新检测 (GitHub Releases API + 镜像、WinHTTP、toast 去重)；检测循环逐次 catch_unwind
   - `build.rs`：把 icons 下的 ICO 嵌入 PE 资源 (桌面 exe 图标)
@@ -163,7 +163,7 @@ DeepSeek Harness (dsh) 的 Windows 系统托盘守护启动器，Rust 编写。
 
 ### dsh 启动与输出日志 (dsh.rs)
 - start_harness 用 `Command::new("cmd.exe")` + `creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED)` 创建 `cmd /c npx -y @deepseek-ai/dsh web`，挂入全局 Job 后用 Toolhelp 线程快照 `OpenThread + ResumeThread` 恢复主线程
-- stdout/stderr 由读取线程分块写入 `~/.dsh/launcher.log` (时间标签 + `[DSH]` 标记；按换行切行，无换行按缓冲块落盘，与启动器日志合并，随 3 天清理 + 10 MiB 大小上限)：npx/node 的全部输出落盘，启动卡顿/失败从此定位 (2026-08-18 曾两次 120 秒超时但无任何线索可查)
+- stdout/stderr 由读取线程分块写入 `~/.dsh/launcher.log` (时间标签 + `[ DSH]` 标记；按换行切行，无换行按缓冲块落盘，与启动器日志合并，随 3 天清理 + 10 MiB 大小上限)：npx/node 的全部输出落盘，启动卡顿/失败从此定位 (2026-08-18 曾两次 120 秒超时但无任何线索可查)
 - 进程树为 cmd→npx→node：cmd 挂入 Job 后才恢复执行；挂接/恢复失败用 Toolhelp 快照递归清理整棵树，避免孤儿
 
 ### 打开资源管理器配置目录
